@@ -2460,6 +2460,7 @@ HAVE_LIST="
     xmllint
     zlib_gzip
     va_profile_avs
+    va_profile_avs2
 "
 
 # options emitted with CONFIG_ prefix but not available on the command line
@@ -3184,6 +3185,7 @@ wmv3_nvdec_hwaccel_select="vc1_nvdec_hwaccel"
 wmv3_vaapi_hwaccel_select="vc1_vaapi_hwaccel"
 wmv3_vdpau_hwaccel_select="vc1_vdpau_hwaccel"
 cavs_vaapi_hwaccel_deps="vaapi va_profile_avs VAPictureParameterBufferAVS"
+avs2_vaapi_hwaccel_deps="vaapi va_profile_avs2 VAPictureParameterBufferAVS2"
 
 # hardware-accelerated codecs
 mediafoundation_deps="mftransform_h MFCreateAlignedMemoryBuffer"
@@ -7119,8 +7121,12 @@ if enabled vaapi; then
     disable va_profile_avs &&
         test_code cc va/va.h "VAProfile p1 = VAProfileAVSJizhun, p2 = VAProfileAVSGuangdian;" &&
         enable va_profile_avs
+    disable va_profile_avs2 &&
+        test_code cc va/va.h "VAProfile p1 = VAProfileAVS2Main, p2 = VAProfileAVS2Main10;" &&
+        enable va_profile_avs2
 
     enabled va_profile_avs && check_type "va/va.h va/va_dec_avs.h" "VAPictureParameterBufferAVS"
+    enabled va_profile_avs2 && check_type "va/va.h va/va_dec_avs2.h" "VAPictureParameterBufferAVS2"
 fi
 
 if enabled_all opencl libdrm ; then

@@ -206,4 +206,10 @@ const AVProfile ff_cavs_profiles[] = {
     { FF_PROFILE_UNKNOWN },
 };
 
+const AVProfile ff_avs2_profiles[] = {
+    { FF_PROFILE_AVS2_MAIN,         "Main"              },
+    { FF_PROFILE_AVS2_MAIN_10,      "Main 10"           },
+    { FF_PROFILE_UNKNOWN },
+};
+
 #endif /* !CONFIG_SMALL */

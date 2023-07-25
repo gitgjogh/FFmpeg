@@ -2463,6 +2463,7 @@ HAVE_LIST="
     xmllint
     zlib_gzip
     openvino2
+    va_profile_avs
 "
 
 # options emitted with CONFIG_ prefix but not available on the command line
@@ -3202,6 +3203,7 @@ wmv3_dxva2_hwaccel_select="vc1_dxva2_hwaccel"
 wmv3_nvdec_hwaccel_select="vc1_nvdec_hwaccel"
 wmv3_vaapi_hwaccel_select="vc1_vaapi_hwaccel"
 wmv3_vdpau_hwaccel_select="vc1_vdpau_hwaccel"
+cavs_vaapi_hwaccel_deps="vaapi va_profile_avs VAPictureParameterBufferAVS"
 
 # hardware-accelerated codecs
 mediafoundation_deps="mftransform_h MFCreateAlignedMemoryBuffer"
@@ -7175,6 +7177,18 @@ if enabled vaapi; then
     check_type "va/va.h va/va_enc_vp8.h"  "VAEncPictureParameterBufferVP8"
     check_type "va/va.h va/va_enc_vp9.h"  "VAEncPictureParameterBufferVP9"
     check_type "va/va.h va/va_enc_av1.h"  "VAEncPictureParameterBufferAV1"
+
+    #
+    # Using 'VA_CHECK_VERSION' in source codes make things easy. But we have to wait
+    # until newly added VAProfile being distributed by VAAPI released version.
+    #
+    # Before or after that, we can use auto-detection to keep version compatibility.
+    # It always works.
+    #
+    disable va_profile_avs &&
+        test_code cc va/va.h "VAProfile p1 = VAProfileAVSJizhun, p2 = VAProfileAVSGuangdian;" &&
+        enable va_profile_avs
+    enabled va_profile_avs && check_type "va/va.h va/va_dec_avs.h" "VAPictureParameterBufferAVS"
 fi
 
 if enabled_all opencl libdrm ; then

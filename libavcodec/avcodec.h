@@ -1729,6 +1729,10 @@ typedef struct AVCodecContext {
 #define FF_PROFILE_EVC_MAIN                 1
 #endif
 
+#define FF_PROFILE_CAVS_JIZHUN                      0x20
+#define FF_PROFILE_CAVS_GUANGDIAN                   0x48
+
+
     /**
      * Encoding level descriptor.
      * - encoding: Set by user, corresponds to a specific level defined by the

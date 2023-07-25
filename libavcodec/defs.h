@@ -192,6 +192,9 @@
 #define AV_PROFILE_EVC_BASELINE             0
 #define AV_PROFILE_EVC_MAIN                 1
 
+#define AV_PROFILE_CAVS_JIZHUN                      0x20
+#define AV_PROFILE_CAVS_GUANGDIAN                   0x48
+
 
 #define AV_LEVEL_UNKNOWN                  -99
 

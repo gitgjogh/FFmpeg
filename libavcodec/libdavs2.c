@@ -87,7 +87,7 @@ static int davs2_dump_frames(AVCodecContext *avctx, davs2_picture_t *pic, int *g
         avctx->has_b_frames = FFMAX(avctx->has_b_frames, !headerset->low_delay);
 
         if (headerset->frame_rate_id < 16)
-            avctx->framerate = ff_avs2_frame_rate_tab[headerset->frame_rate_id];
+            avctx->framerate = ff_avs2_frame_rate_c2q(headerset->frame_rate_id);
         *got_frame = 0;
         return 0;
     }

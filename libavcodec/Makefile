@@ -283,6 +283,7 @@ OBJS-$(CONFIG_BRENDER_PIX_DECODER)     += brenderpix.o
 OBJS-$(CONFIG_C93_DECODER)             += c93.o
 OBJS-$(CONFIG_CAVS_DECODER)            += cavs.o cavsdec.o cavsdsp.o \
                                           cavsdata.o
+OBJS-$(CONFIG_AVS2_DECODER)            += avs2.o avs2dec.o avs2dec_headers.o
 OBJS-$(CONFIG_CBD2_DECODER)            += dpcm.o
 OBJS-$(CONFIG_CCAPTION_DECODER)        += ccaption_dec.o ass.o
 OBJS-$(CONFIG_CDGRAPHICS_DECODER)      += cdgraphics.o
@@ -1043,6 +1044,8 @@ OBJS-$(CONFIG_VP9_VAAPI_HWACCEL)          += vaapi_vp9.o
 OBJS-$(CONFIG_VP9_VDPAU_HWACCEL)          += vdpau_vp9.o
 OBJS-$(CONFIG_VP9_VIDEOTOOLBOX_HWACCEL)   += videotoolbox_vp9.o
 OBJS-$(CONFIG_VP8_QSV_HWACCEL)            += qsvdec.o
+OBJS-$(CONFIG_CAVS_VAAPI_HWACCEL)         += vaapi_cavs.o
+OBJS-$(CONFIG_AVS2_VAAPI_HWACCEL)         += vaapi_avs2.o
 
 # Objects duplicated from other libraries for shared builds
 SHLIBOBJS                              += log2_tab.o reverse.o

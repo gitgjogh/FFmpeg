@@ -407,6 +407,14 @@ static const struct {
                            H264ConstrainedBaseline),
     MAP(H264,        H264_MAIN,       H264Main    ),
     MAP(H264,        H264_HIGH,       H264High    ),
+#if HAVE_VA_PROFILE_AVS
+    MAP(CAVS,        CAVS_JIZHUN,     AVSJizhun   ),
+    MAP(CAVS,        CAVS_GUANGDIAN,  AVSGuangdian),
+#endif
+#if HAVE_VA_PROFILE_AVS2
+    MAP(AVS2,        AVS2_MAIN,       AVS2Main    ),
+    MAP(AVS2,        AVS2_MAIN_10,    AVS2Main10  ),
+#endif
 #if VA_CHECK_VERSION(0, 37, 0)
     MAP(HEVC,        HEVC_MAIN,       HEVCMain    ),
     MAP(HEVC,        HEVC_MAIN_10,    HEVCMain10  ),
@@ -606,6 +614,7 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
         case AV_CODEC_ID_H264:
         case AV_CODEC_ID_HEVC:
         case AV_CODEC_ID_AV1:
+        case AV_CODEC_ID_AVS2:
             frames->initial_pool_size += 16;
             break;
         case AV_CODEC_ID_VP9:

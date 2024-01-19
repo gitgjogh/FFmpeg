@@ -20,6 +20,7 @@
  */
 
 #include "hwconfig.h"
+#include "hwaccel_internal.h"
 #include "vaapi_decode.h"
 #include "cavs.h"
 
@@ -71,13 +72,11 @@ static int vaapi_avs_start_frame(AVCodecContext         *avctx,
         .beta_offset = h->beta_offset,
         .skip_mode_flag_flag = h->skip_mode_flag,
         .picture_reference_flag = h->ref_flag,
-        .no_forward_reference_flag = h->no_forward_ref_flag,
     };
 
     if (h->profile == 0x48) {
 		pic_param.guangdian_fields.guangdian_flag = 1;
         pic_param.guangdian_fields.aec_flag = h->aec_flag;
-        pic_param.guangdian_fields.pb_field_enhanced_flag = h->pb_field_enhanced_flag;
         pic_param.guangdian_fields.weight_quant_flag = h->weight_quant_flag;
         pic_param.guangdian_fields.chroma_quant_param_delta_cb = h->chroma_quant_param_delta_cb;
         pic_param.guangdian_fields.chroma_quant_param_delta_cr = h->chroma_quant_param_delta_cr;
@@ -148,11 +147,11 @@ fail:
     return err;
 }
 
-const AVHWAccel ff_cavs_vaapi_hwaccel = {
-    .name                 = "cavs_vaapi",
-    .type                 = AVMEDIA_TYPE_VIDEO,
-    .id                   = AV_CODEC_ID_CAVS,
-    .pix_fmt              = AV_PIX_FMT_VAAPI,
+const FFHWAccel ff_cavs_vaapi_hwaccel = {
+    .p.name                 = "cavs_vaapi",
+    .p.type                 = AVMEDIA_TYPE_VIDEO,
+    .p.id                   = AV_CODEC_ID_CAVS,
+    .p.pix_fmt              = AV_PIX_FMT_VAAPI,
     .start_frame          = &vaapi_avs_start_frame,
     .end_frame            = &vaapi_avs_end_frame,
     .decode_slice         = &vaapi_avs_decode_slice,

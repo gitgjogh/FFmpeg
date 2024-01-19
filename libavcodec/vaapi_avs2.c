@@ -20,6 +20,7 @@
  */
 
 #include "hwconfig.h"
+#include "hwaccel_internal.h"
 #include "vaapi_decode.h"
 #include "avs2dec.h"
 
@@ -209,11 +210,11 @@ fail:
     return err;
 }
 
-const AVHWAccel ff_avs2_vaapi_hwaccel = {
-    .name                 = "avs2_vaapi",
-    .type                 = AVMEDIA_TYPE_VIDEO,
-    .id                   = AV_CODEC_ID_AVS2,
-    .pix_fmt              = AV_PIX_FMT_VAAPI,
+const FFHWAccel ff_avs2_vaapi_hwaccel = {
+    .p.name                 = "avs2_vaapi",
+    .p.type                 = AVMEDIA_TYPE_VIDEO,
+    .p.id                   = AV_CODEC_ID_AVS2,
+    .p.pix_fmt              = AV_PIX_FMT_VAAPI,
     .start_frame          = &vaapi_avs2_start_frame,
     .end_frame            = &vaapi_avs2_end_frame,
     .decode_slice         = &vaapi_avs2_decode_slice,

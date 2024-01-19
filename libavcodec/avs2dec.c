@@ -34,6 +34,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/pixdesc.h"
 #include "mpeg12data.h"
+#include "hwaccel_internal.h"
 #include "hwconfig.h"
 #include "profiles.h"
 #include "avs2dec.h"
@@ -200,7 +201,7 @@ static int ff_avs2_dpb_get_current_frame(AVS2Context *h)
     AVS2_CHECK_RET(ret);
 
     if (h->avctx->hwaccel) {
-        const AVHWAccel *hwaccel = h->avctx->hwaccel;
+        const FFHWAccel *hwaccel = ffhwaccel(h->avctx->hwaccel);
         av_assert0(!h->curr_frame->hwaccel_picture_private);
         if (hwaccel->frame_priv_data_size) {
             h->curr_frame->hwaccel_priv_buf = av_buffer_allocz(hwaccel->frame_priv_data_size);
@@ -395,6 +396,7 @@ static av_cold int ff_avs2_decode_end(AVCodecContext *avctx)
 static int ff_avs2_decode_frame_data(AVS2Context *h, const uint8_t *data, int size)
 {
     AVCodecContext *const avctx = h->avctx;
+    const FFHWAccel *hwaccel = ffhwaccel(avctx->hwaccel);
     int ret = 0;
     int i_unit = 0;
     int b_got_pic_hdr = 0;
@@ -428,8 +430,8 @@ static int ff_avs2_decode_frame_data(AVS2Context *h, const uint8_t *data, int si
                 ret = ff_avs2_get_pixel_format(avctx);
                 AVS2_CHECK_RET(ret);
             }
-            if (avctx->hwaccel && avctx->hwaccel->decode_params) {
-                ret = avctx->hwaccel->decode_params(avctx, unit->start_code, unit_data, unit_size);
+            if (hwaccel && hwaccel->decode_params) {
+                ret = hwaccel->decode_params(avctx, unit->start_code, unit_data, unit_size);
                 AVS2_CHECK_RET(ret);
             }
             break;
@@ -453,8 +455,8 @@ static int ff_avs2_decode_frame_data(AVS2Context *h, const uint8_t *data, int si
             ret = ff_avs2_dpb_get_current_frame(h);
             AVS2_CHECK_RET(ret);
 
-            if (avctx->hwaccel) {
-                ret = avctx->hwaccel->start_frame(avctx, unit_data, unit_size);
+            if (hwaccel) {
+                ret = hwaccel->start_frame(avctx, unit_data, unit_size);
                 AVS2_CHECK_RET(ret);
             }
             break;
@@ -472,8 +474,8 @@ static int ff_avs2_decode_frame_data(AVS2Context *h, const uint8_t *data, int si
             h->curr_frame->n_slice += 1;
             ret = ff_avs2_decode_slice_header(h, unit->start_code, bs);
             AVS2_CHECK_RET(ret);
-            if (avctx->hwaccel) {
-                ret = avctx->hwaccel->decode_slice(avctx, unit_data, unit_size);
+            if (hwaccel) {
+                ret = hwaccel->decode_slice(avctx, unit_data, unit_size);
                 AVS2_CHECK_RET(ret);
             } else {
                 //TODO: Native decoder has not been supported yet. Remove this after implementation.
@@ -489,8 +491,8 @@ static int ff_avs2_decode_frame_data(AVS2Context *h, const uint8_t *data, int si
         AVS2_CHECK_RET(ret);
     }
 
-    if (h->curr_frame && h->curr_frame->n_slice > 0 && avctx->hwaccel) {
-        ret = avctx->hwaccel->end_frame(avctx);
+    if (h->curr_frame && h->curr_frame->n_slice > 0 && hwaccel) {
+        ret = hwaccel->end_frame(avctx);
         AVS2_CHECK_RET(ret);
     }
 

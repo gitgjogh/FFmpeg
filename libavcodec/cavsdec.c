@@ -31,6 +31,7 @@
 #include "avcodec.h"
 #include "get_bits.h"
 #include "golomb.h"
+#include "hwaccel_internal.h"
 #include "hwconfig.h"
 #include "profiles.h"
 #include "cavs.h"
@@ -1139,8 +1140,9 @@ static int hwaccel_pic(AVSContext *h)
     const uint8_t *slc_start = frm_start;
     const uint8_t *slc_end = frm_end;
     GetBitContext gb = h->gb;
+    const FFHWAccel *hwaccel = ffhwaccel(h->avctx->hwaccel);
 
-    ret = h->avctx->hwaccel->start_frame(h->avctx, NULL, 0);
+    ret = hwaccel->start_frame(h->avctx, NULL, 0);
     if (ret < 0)
         return ret;
 
@@ -1155,7 +1157,7 @@ static int hwaccel_pic(AVSContext *h)
             break;
         }
 
-        ret = h->avctx->hwaccel->decode_slice(h->avctx, slc_start, slc_end - slc_start);
+        ret = hwaccel->decode_slice(h->avctx, slc_start, slc_end - slc_start);
         if (ret < 0) {
             break;
         }
@@ -1167,7 +1169,7 @@ static int hwaccel_pic(AVSContext *h)
     if (ret < 0)
         return ret;
 
-    return h->avctx->hwaccel->end_frame(h->avctx);
+    return hwaccel->end_frame(h->avctx);
 }
 
 /**
@@ -1226,7 +1228,7 @@ static int decode_pic(AVSContext *h)
     cavs_frame_unref(&h->cur);
 
     skip_bits(&h->gb, 16);//bbv_delay
-    if (h->profile == FF_PROFILE_CAVS_GUANGDIAN) {
+    if (h->profile == AV_PROFILE_CAVS_GUANGDIAN) {
         skip_bits(&h->gb, 8);//bbv_dwlay_extension
     }
 
@@ -1267,7 +1269,7 @@ static int decode_pic(AVSContext *h)
         return ret;
 
     if (h->avctx->hwaccel) {
-        const AVHWAccel *hwaccel = h->avctx->hwaccel;
+        const FFHWAccel *hwaccel = ffhwaccel(h->avctx->hwaccel);
         av_assert0(!h->cur.hwaccel_picture_private);
         if (hwaccel->frame_priv_data_size) {
             h->cur.hwaccel_priv_buf = av_buffer_allocz(hwaccel->frame_priv_data_size);
@@ -1355,7 +1357,7 @@ static int decode_pic(AVSContext *h)
     }
 
     h->weight_quant_flag = 0;
-    if (h->profile == FF_PROFILE_CAVS_GUANGDIAN) {
+    if (h->profile == AV_PROFILE_CAVS_GUANGDIAN) {
         h->weight_quant_flag = get_bits1(&h->gb);
         if (h->weight_quant_flag) {
             int wq_param[6] = {128, 128, 128, 128, 128, 128};
@@ -1572,7 +1574,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
 
                 avctx->pix_fmt = ret;
 
-                if (h->profile == FF_PROFILE_CAVS_GUANGDIAN && !avctx->hwaccel) {
+                if (h->profile == AV_PROFILE_CAVS_GUANGDIAN && !avctx->hwaccel) {
                     av_log(avctx, AV_LOG_ERROR, "Your platform doesn't suppport hardware"
                                     " accelerated for CAVS Guangdian Profile decoding.\n");
                     return AVERROR(ENOTSUP);

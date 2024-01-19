@@ -112,10 +112,7 @@ static void parse_avs2_seq_header(AVCodecParserContext *s, const uint8_t *buf,
     s->height = height;
     s->coded_width = FFALIGN(width, 8);
     s->coded_height = FFALIGN(height, 8);
-    avctx->framerate.num =
-        ff_avs2_frame_rate_tab[frame_rate_code].num;
-    avctx->framerate.den =
-        ff_avs2_frame_rate_tab[frame_rate_code].den;
+    avctx->framerate = ff_avs2_frame_rate_c2q(frame_rate_code);
     avctx->has_b_frames = FFMAX(avctx->has_b_frames, !low_delay);
 
     av_log(avctx, AV_LOG_DEBUG,

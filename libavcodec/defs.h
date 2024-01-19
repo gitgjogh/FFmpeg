@@ -195,6 +195,10 @@
 #define AV_PROFILE_CAVS_JIZHUN                      0x20
 #define AV_PROFILE_CAVS_GUANGDIAN                   0x48
 
+#define AV_PROFILE_AVS2_PIC                         0x12
+#define AV_PROFILE_AVS2_MAIN                        0x20
+#define AV_PROFILE_AVS2_MAIN_10                     0x22
+
 
 #define AV_LEVEL_UNKNOWN                  -99
 

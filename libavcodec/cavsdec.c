@@ -1256,8 +1256,18 @@ static int decode_pic(AVSContext *h)
             av_log(h->avctx, AV_LOG_DEBUG, "timecode: %d:%d:%d.%d\n", 
                     tc[0], tc[1], tc[2], tc[3]);
         }
-            
-        skip_bits(&h->gb, 1);
+
+        /* old sample clips were all progressive and no low_delay,
+           bump stream revision if detected otherwise */
+        if (h->low_delay || !(show_bits(&h->gb, 9) & 1))
+            h->stream_revision = 1;
+        /* similarly test top_field_first and repeat_first_field */
+        else if (show_bits(&h->gb, 11) & 3)
+            h->stream_revision = 1;
+        if (h->stream_revision > 0)
+            skip_bits(&h->gb, 1); //marker_bit
+
+        av_log(h->avctx, AV_LOG_DEBUG, "stream_revision: %d\n", h->stream_revision);
     }
 
     if (get_bits_left(&h->gb) < 23)
@@ -1350,6 +1360,7 @@ static int decode_pic(AVSContext *h)
         if (   h->alpha_offset < -64 || h->alpha_offset > 64
             || h-> beta_offset < -64 || h-> beta_offset > 64) {
             h->alpha_offset = h->beta_offset  = 0;
+            av_log(h->avctx, AV_LOG_ERROR, "invalid loop filter params\n");
             return AVERROR_INVALIDDATA;
         }
     } else {
@@ -1389,8 +1400,10 @@ static int decode_pic(AVSContext *h)
                 h->weight_quant_flag, h->aec_flag);
     }
 
-    skip_stuffing_bits(h);
-    skip_extension_and_user_data(h);
+    if (h->stream_revision > 0) {
+        skip_stuffing_bits(h);
+        skip_extension_and_user_data(h);
+    }
 
     ret = 0;
     if (h->avctx->hwaccel) {

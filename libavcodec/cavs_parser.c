@@ -65,22 +65,6 @@ static int cavs_find_frame_end(ParseContext *pc, const uint8_t *buf,
                 pc->state=-1;
                 return i-3;
             }
-            if((state&0xFFFFFF00) == 0x100){
-                if(state != EXT_START_CODE && state != USER_START_CODE){
-                    state = state >> 8;
-                    break;
-                }
-            }
-        }
-        for(; i<buf_size; i++){
-            state= (state<<8) | buf[i];
-            if((state&0xFFFFFF00) == 0x100){
-                if(state > SLICE_MAX_START_CODE){
-                    pc->frame_start_found=0;
-                    pc->state=-1;
-                    return i-3;
-                }
-            }
         }
     }
     pc->frame_start_found= pic_found;

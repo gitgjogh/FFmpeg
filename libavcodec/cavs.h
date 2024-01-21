@@ -186,12 +186,36 @@ typedef struct AVSContext {
     int mb_width, mb_height;
     int width, height;
     int stream_revision; ///<0 for samples from 2006, 1 for rm52j encoder
-    int progressive;
+    int progressive_seq;
+    int progressive_frame;
     int pic_structure;
     int skip_mode_flag; ///< select between skip_count or one skip_flag per MB
     int loop_filter_disable;
     int alpha_offset, beta_offset;
     int ref_flag;
+
+    /** \defgroup guangdian profile
+     * @{
+     */
+    int aec_flag;
+    int weight_quant_flag;
+    int chroma_quant_param_delta_cb;
+    int chroma_quant_param_delta_cr;
+    uint8_t wqm_8x8[64];
+    /**@}*/
+
+    /** \defgroup slice weighting
+     * FFmpeg don't support slice weighting natively, but maybe needed for HWaccel.
+     * @{
+     */
+    uint32_t slice_weight_pred_flag : 1;
+    uint32_t mb_weight_pred_flag    : 1;
+    uint8_t luma_scale[4];
+    int8_t luma_shift[4];
+    uint8_t chroma_scale[4];
+    int8_t chroma_shift[4];
+    /**@}*/
+
     int mbx, mby, mbidx; ///< macroblock coordinates
     int flags;         ///< availability flags of neighbouring macroblocks
     int stc;           ///< last start code

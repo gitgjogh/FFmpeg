@@ -30,12 +30,50 @@
 #include "avcodec.h"
 #include "get_bits.h"
 #include "golomb.h"
+#include "profiles.h"
 #include "cavs.h"
 #include "codec_internal.h"
 #include "decode.h"
 #include "mathops.h"
 #include "mpeg12data.h"
 #include "startcode.h"
+
+static const uint8_t default_wq_param[4][6] = {
+    {128,  98, 106, 116, 116, 128},
+    {135, 143, 143, 160, 160, 213},
+    {128,  98, 106, 116, 116, 128},
+    {128, 128, 128, 128, 128, 128},
+};
+static const uint8_t wq_model_2_param[4][64] = {
+    {
+        0, 0, 0, 4, 4, 4, 5, 5,
+        0, 0, 3, 3, 3, 3, 5, 5,
+        0, 3, 2, 2, 1, 1, 5, 5,
+        4, 3, 2, 2, 1, 5, 5, 5,
+        4, 3, 1, 1, 5, 5, 5, 5,
+        4, 3, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }, {
+        0, 0, 0, 4, 4, 4, 5, 5,
+        0, 0, 4, 4, 4, 4, 5, 5,
+        0, 3, 2, 2, 2, 1, 5, 5,
+        3, 3, 2, 2, 1, 5, 5, 5,
+        3, 3, 2, 1, 5, 5, 5, 5,
+        3, 3, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }, {
+        0, 0, 0, 4, 4, 3, 5, 5,
+        0, 0, 4, 4, 3, 2, 5, 5,
+        0, 4, 4, 3, 2, 1, 5, 5,
+        4, 4, 3, 2, 1, 5, 5, 5,
+        4, 3, 2, 1, 5, 5, 5, 5,
+        3, 2, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }
+};
 
 static const uint8_t mv_scan[4] = {
     MV_FWD_X0, MV_FWD_X1,
@@ -927,7 +965,11 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
 
 static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
 {
-    if (h->stc > 0xAF)
+    int i, nref;
+
+    av_log(h->avctx, AV_LOG_TRACE, "slice start code 0x%02x\n", h->stc);
+
+    if (h->stc > SLICE_MAX_START_CODE)
         av_log(h->avctx, AV_LOG_ERROR, "unexpected start code 0x%02x\n", h->stc);
 
     if (h->stc >= h->mb_height) {
@@ -946,11 +988,29 @@ static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
     }
     /* inter frame or second slice can have weighting params */
     if ((h->cur.f->pict_type != AV_PICTURE_TYPE_I) ||
-        (!h->pic_structure && h->mby >= h->mb_width / 2))
-        if (get_bits1(gb)) { //slice_weighting_flag
+        (!h->pic_structure && h->mby >= h->mb_height / 2)) {
+        h->slice_weight_pred_flag = get_bits1(gb);
+        if (h->slice_weight_pred_flag) {
+            nref = h->cur.f->pict_type == AV_PICTURE_TYPE_I ? 1 : (h->pic_structure ? 2 : 4);
+            for (i = 0; i < nref; i++) {
+                h->luma_scale[i] = get_bits(gb, 8);
+                h->luma_shift[i] = get_sbits(gb, 8);
+                skip_bits1(gb);
+                h->chroma_scale[i] = get_bits(gb, 8);
+                h->chroma_shift[i] = get_sbits(gb, 8);
+                skip_bits1(gb);
+            }
+            h->mb_weight_pred_flag = get_bits1(gb);
+            if (!h->avctx->hwaccel) {
             av_log(h->avctx, AV_LOG_ERROR,
                    "weighted prediction not yet supported\n");
         }
+        }
+    }
+    if (h->aec_flag) {
+        align_get_bits(gb);
+    }
+
     return 0;
 }
 
@@ -1108,7 +1168,11 @@ static int decode_pic(AVSContext *h)
 
     cavs_frame_unref(&h->cur);
 
-    skip_bits(&h->gb, 16);//bbv_dwlay
+    skip_bits(&h->gb, 16);//bbv_delay
+    if (h->profile == AV_PROFILE_CAVS_GUANGDIAN) {
+        skip_bits(&h->gb, 8);//bbv_dwlay_extension
+    }
+
     if (h->stc == PIC_PB_START_CODE) {
         h->cur.f->pict_type = get_bits(&h->gb, 2) + AV_PICTURE_TYPE_I;
         if (h->cur.f->pict_type > AV_PICTURE_TYPE_B) {
@@ -1192,9 +1256,9 @@ static int decode_pic(AVSContext *h)
 
     if (h->low_delay)
         get_ue_golomb(&h->gb); //bbv_check_times
-    h->progressive   = get_bits1(&h->gb);
+    h->progressive_frame = get_bits1(&h->gb);
     h->pic_structure = 1;
-    if (!h->progressive)
+    if (!h->progressive_frame)
         h->pic_structure = get_bits1(&h->gb);
     if (!h->pic_structure && h->stc == PIC_PB_START_CODE)
         skip_bits1(&h->gb);     //advanced_pred_mode_disable
@@ -1203,9 +1267,11 @@ static int decode_pic(AVSContext *h)
     h->pic_qp_fixed =
     h->qp_fixed = get_bits1(&h->gb);
     h->qp       = get_bits(&h->gb, 6);
+    h->skip_mode_flag = 0;
+    h->ref_flag = 0;
     if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
-        if (!h->progressive && !h->pic_structure)
-            skip_bits1(&h->gb);//what is this?
+        if (!h->progressive_frame && !h->pic_structure)
+            h->skip_mode_flag  = get_bits1(&h->gb);
         skip_bits(&h->gb, 4);   //reserved bits
     } else {
         if (!(h->cur.f->pict_type == AV_PICTURE_TYPE_B && h->pic_structure == 1))
@@ -1220,10 +1286,44 @@ static int decode_pic(AVSContext *h)
         if (   h->alpha_offset < -64 || h->alpha_offset > 64
             || h-> beta_offset < -64 || h-> beta_offset > 64) {
             h->alpha_offset = h->beta_offset  = 0;
+            av_log(h->avctx, AV_LOG_ERROR, "invalid loop filter params\n");
             return AVERROR_INVALIDDATA;
         }
     } else {
         h->alpha_offset = h->beta_offset  = 0;
+    }
+
+    h->weight_quant_flag = 0;
+    if (h->profile == AV_PROFILE_CAVS_GUANGDIAN) {
+        h->weight_quant_flag = get_bits1(&h->gb);
+        if (h->weight_quant_flag) {
+            int wq_param[6] = {128, 128, 128, 128, 128, 128};
+            int i, wqp_index, wq_model;
+            const uint8_t *m2p;
+
+            skip_bits1(&h->gb);
+            if (!get_bits1(&h->gb)) {
+                h->chroma_quant_param_delta_cb = get_se_golomb(&h->gb);
+                h->chroma_quant_param_delta_cr = get_se_golomb(&h->gb);
+            }
+            wqp_index = get_bits(&h->gb, 2);
+            wq_model = get_bits(&h->gb, 2);
+            m2p = wq_model_2_param[wq_model];
+
+            for (i = 0; i < 6; i++) {
+                int delta = (wqp_index == 1 || wqp_index == 2) ? get_se_golomb(&h->gb) : 0;
+                wq_param[i] = default_wq_param[wqp_index][i] + delta;
+                av_log(h->avctx, AV_LOG_DEBUG, "wqp[%d]=%d\n", i, wq_param[i]);
+            }
+            for (i = 0; i < 64; i++) {
+                h->wqm_8x8[i] = wq_param[ m2p[i] ];
+            }
+        } else {
+            memset(h->wqm_8x8, 128, sizeof(h->wqm_8x8));
+        }
+        h->aec_flag = get_bits1(&h->gb);
+        av_log(h->avctx, AV_LOG_DEBUG, "wq_flag=%d, aec_flag=%d\n",
+                h->weight_quant_flag, h->aec_flag);
     }
 
     if (h->stream_revision > 0) {
@@ -1311,13 +1411,8 @@ static int decode_seq_header(AVSContext *h)
     int ret;
 
     h->profile = get_bits(&h->gb, 8);
-    if (h->profile != 0x20) {
-        avpriv_report_missing_feature(h->avctx,
-                                      "only supprt JiZhun profile");
-        return AVERROR_PATCHWELCOME;
-    }
     h->level   = get_bits(&h->gb, 8);
-    skip_bits1(&h->gb); //progressive sequence
+    h->progressive_seq = get_bits1(&h->gb);
 
     width  = get_bits(&h->gb, 14);
     height = get_bits(&h->gb, 14);
@@ -1344,6 +1439,9 @@ static int decode_seq_header(AVSContext *h)
     skip_bits1(&h->gb);    //marker_bit
     skip_bits(&h->gb, 12); //bit_rate_upper
     h->low_delay =  get_bits1(&h->gb);
+    av_log(h->avctx, AV_LOG_DEBUG,
+            "seq: profile=0x%02x, level=0x%02x, size=%dx%d, low_delay=%d\n",
+            h->profile, h->level, width, height, h->low_delay);
 
     ret = ff_set_dimensions(h->avctx, width, height);
     if (ret < 0)
@@ -1369,8 +1467,6 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                              int *got_frame, AVPacket *avpkt)
 {
     AVSContext *h      = avctx->priv_data;
-    const uint8_t *buf = avpkt->data;
-    int buf_size       = avpkt->size;
     uint32_t stc       = -1;
     int input_size, ret;
     const uint8_t *buf_end;
@@ -1388,16 +1484,18 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
 
     h->stc = 0;
 
-    buf_ptr = buf;
-    buf_end = buf + buf_size;
-    for(;;) {
+    buf_ptr = avpkt->data;
+    buf_end = avpkt->data + avpkt->size;
+    for(; buf_ptr < buf_end;) {
         buf_ptr = avpriv_find_start_code(buf_ptr, buf_end, &stc);
         if ((stc & 0xFFFFFE00) || buf_ptr == buf_end) {
             if (!h->stc)
                 av_log(h->avctx, AV_LOG_WARNING, "no frame decoded\n");
-            return FFMAX(0, buf_ptr - buf);
+            return FFMAX(0, buf_ptr - avpkt->data);
         }
         input_size = (buf_end - buf_ptr) * 8;
+        av_log(h->avctx, AV_LOG_TRACE, "Found start code 0x%04x, sz=%d\n",
+                stc, input_size / 8);
         switch (stc) {
         case CAVS_START_CODE:
             init_get_bits(&h->gb, buf_ptr, input_size);
@@ -1464,12 +1562,16 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
             break;
         default:
             if (stc <= SLICE_MAX_START_CODE) {
+                h->stc = stc & 0xff;
                 init_get_bits(&h->gb, buf_ptr, input_size);
                 decode_slice_header(h, &h->gb);
+            } else {
+                av_log(h->avctx, AV_LOG_WARNING, "Skip unsupported start code 0x%04X\n", stc);
             }
             break;
         }
     }
+    return (buf_ptr - avpkt->data);
 }
 
 const FFCodec ff_cavs_decoder = {

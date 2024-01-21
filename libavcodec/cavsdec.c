@@ -1061,6 +1061,7 @@ static int decode_pic(AVSContext *h)
     int ret;
     int skip_count    = -1;
     enum cavs_mb mb_type;
+    char tc[4];
 
     if (!h->top_qp) {
         av_log(h->avctx, AV_LOG_ERROR, "No sequence header decoded yet\n");
@@ -1082,8 +1083,16 @@ static int decode_pic(AVSContext *h)
             return AVERROR_INVALIDDATA;
     } else {
         h->cur.f->pict_type = AV_PICTURE_TYPE_I;
-        if (get_bits1(&h->gb))
-            skip_bits(&h->gb, 24);//time_code
+        if (get_bits1(&h->gb)) {    //time_code
+            skip_bits(&h->gb, 1);
+            tc[0] = get_bits(&h->gb, 5);
+            tc[1] = get_bits(&h->gb, 6);
+            tc[2] = get_bits(&h->gb, 6);
+            tc[3] = get_bits(&h->gb, 6);
+            av_log(h->avctx, AV_LOG_DEBUG, "timecode: %d:%d:%d.%d\n", 
+                    tc[0], tc[1], tc[2], tc[3]);
+        }
+
         /* old sample clips were all progressive and no low_delay,
            bump stream revision if detected otherwise */
         if (h->low_delay || !(show_bits(&h->gb, 9) & 1))

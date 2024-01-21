@@ -954,6 +954,80 @@ static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
     return 0;
 }
 
+/**
+ * skip stuffing bits before next start code "0x000001"
+ * @return '0' no stuffing bits placed at h->gb being skip, else '1'.
+ */
+static inline int skip_stuffing_bits(AVSContext *h)
+{
+    GetBitContext gb0 = h->gb;
+    GetBitContext *gb = &h->gb;
+    const uint8_t *start;
+    const uint8_t *ptr;
+    const uint8_t *end;
+    int align;
+    int stuffing_zeros;
+
+    /**
+     * According to spec, there should be one stuffing_bit '1' and
+     * 0~7 stuffing_bit '0'. But seems not all the stream follow
+     * "next_start_code()" strictly.
+     */
+    align = (-get_bits_count(gb)) & 7;
+    if (align == 0 && show_bits_long(gb, 8) == 0x80) {
+        skip_bits_long(gb, 8);
+    }
+
+    /**
+     *  skip leading zero bytes before 0x 00 00 01 stc
+     */
+    ptr = start = align_get_bits(gb);
+    end = gb->buffer_end;
+    while (ptr < end && *ptr == 0)
+        ptr++;
+
+    if ((ptr >= end) || (*ptr == 1 && ptr - start >= 2)) {
+        stuffing_zeros = (ptr >= end ? end - start : ptr - start - 2);
+        if (stuffing_zeros > 0)
+            av_log(h->avctx, AV_LOG_DEBUG, "Skip 0x%x stuffing zeros @0x%x.\n",
+                    stuffing_zeros, (int)(start - gb->buffer));
+        skip_bits_long(gb, stuffing_zeros * 8);
+        return 1;
+    } else {
+        av_log(h->avctx, AV_LOG_DEBUG, "No next_start_code() found @0x%x.\n",
+                (int)(start - gb->buffer));
+        goto restore_get_bits;
+    }
+
+restore_get_bits:
+    h->gb = gb0;
+    return 0;
+}
+
+static inline int skip_extension_and_user_data(AVSContext *h)
+{
+    int stc = -1;
+    const uint8_t *start = align_get_bits(&h->gb);
+    const uint8_t *end = h->gb.buffer_end;
+    const uint8_t *ptr, *next;
+
+    for (ptr = start; ptr + 4 < end; ptr = next) {
+        stc = show_bits_long(&h->gb, 32);
+        if (stc != EXT_START_CODE && stc != USER_START_CODE) {
+            break;
+        }
+        next = avpriv_find_start_code(ptr + 4, end, &stc);
+        if (next < end) {
+            next -= 4;
+        }
+        skip_bits(&h->gb, (next - ptr) * 8);
+        av_log(h->avctx, AV_LOG_DEBUG, "skip %d byte ext/user data\n",
+                (int)(next - ptr));
+    }
+
+    return ptr > start;
+}
+
 static inline int check_for_slice(AVSContext *h)
 {
     GetBitContext *gb = &h->gb;
@@ -1019,6 +1093,8 @@ static int decode_pic(AVSContext *h)
             h->stream_revision = 1;
         if (h->stream_revision > 0)
             skip_bits(&h->gb, 1); //marker_bit
+
+        av_log(h->avctx, AV_LOG_DEBUG, "stream_revision: %d\n", h->stream_revision);
     }
 
     if (get_bits_left(&h->gb) < 23)
@@ -1094,6 +1170,11 @@ static int decode_pic(AVSContext *h)
         }
     } else {
         h->alpha_offset = h->beta_offset  = 0;
+    }
+
+    if (h->stream_revision > 0) {
+        skip_stuffing_bits(h);
+        skip_extension_and_user_data(h);
     }
 
     ret = 0;
@@ -1308,6 +1389,12 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
             break;
         case USER_START_CODE:
             //mpeg_decode_user_data(avctx, buf_ptr, input_size);
+            break;
+        case VIDEO_EDIT_CODE:
+            av_log(h->avctx, AV_LOG_WARNING, "Skip video_edit_code\n");
+            break;
+        case VIDEO_SEQ_END_CODE:
+            av_log(h->avctx, AV_LOG_WARNING, "Skip video_sequence_end_code\n");
             break;
         default:
             if (stc <= SLICE_MAX_START_CODE) {

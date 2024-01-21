@@ -1499,7 +1499,10 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
         switch (stc) {
         case CAVS_START_CODE:
             init_get_bits(&h->gb, buf_ptr, input_size);
-            decode_seq_header(h);
+            if ((ret = decode_seq_header(h)) < 0)
+                return ret;
+            avctx->profile = h->profile;
+            avctx->level = h->level;
             break;
         case PIC_I_START_CODE:
             if (!h->got_keyframe) {

@@ -166,6 +166,7 @@ struct dec_2dvlc {
 typedef struct AVSFrame {
     AVFrame *f;
     int poc;
+    int outputed;
 } AVSFrame;
 
 typedef struct AVSContext {
@@ -177,6 +178,7 @@ typedef struct AVSContext {
     GetBitContext gb;
     AVSFrame cur;     ///< currently decoded frame
     AVSFrame DPB[2];  ///< reference frames
+    AVSFrame out[3];  ///< output queue, size 2 maybe enough
     int dist[2];     ///< temporal distances from current frame to ref frames
     int low_delay;
     int profile, level;

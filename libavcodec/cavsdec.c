@@ -1056,6 +1056,44 @@ static inline int check_for_slice(AVSContext *h)
  *
  ****************************************************************************/
 
+/**
+ * @brief remove frame out of dpb
+ */
+static void cavs_frame_unref(AVSFrame *frame)
+{
+    /* frame->f can be NULL if context init failed */
+    if (!frame->f || !frame->f->buf[0])
+        return;
+
+    av_frame_unref(frame->f);
+}
+
+static int output_one_frame(AVSContext *h, AVFrame *data, int *got_frame)
+{
+    if (h->out[0].f->buf[0]) {
+        av_log(h->avctx, AV_LOG_DEBUG, "output frame: poc=%d\n", h->out[0].poc);
+        av_frame_move_ref(data, h->out[0].f);
+        *got_frame = 1;
+
+        // out[0] <- out[1] <- out[2] <- out[0]
+        cavs_frame_unref(&h->out[2]);
+        FFSWAP(AVSFrame, h->out[0], h->out[2]);
+        FFSWAP(AVSFrame, h->out[0], h->out[1]);
+
+        return 1;
+    }
+
+    return 0;
+}
+
+static void queue_one_frame(AVSContext *h, AVSFrame *out)
+{
+    int idx = !h->out[0].f->buf[0] ? 0 : (!h->out[1].f->buf[0] ? 1 : 2);
+    av_log(h->avctx, AV_LOG_DEBUG, "queue in out[%d]: poc=%d\n", idx, out->poc);
+    av_frame_ref(h->out[idx].f, out->f);
+    h->out[idx].poc = out->poc;
+}
+
 static int decode_pic(AVSContext *h)
 {
     int ret;
@@ -1068,7 +1106,7 @@ static int decode_pic(AVSContext *h)
         return AVERROR_INVALIDDATA;
     }
 
-    av_frame_unref(h->cur.f);
+    cavs_frame_unref(&h->cur);
 
     skip_bits(&h->gb, 16);//bbv_dwlay
     if (h->stc == PIC_PB_START_CODE) {
@@ -1077,10 +1115,13 @@ static int decode_pic(AVSContext *h)
             av_log(h->avctx, AV_LOG_ERROR, "illegal picture type\n");
             return AVERROR_INVALIDDATA;
         }
+
         /* make sure we have the reference frames we need */
-        if (!h->DPB[0].f->data[0] ||
-           (!h->DPB[1].f->data[0] && h->cur.f->pict_type == AV_PICTURE_TYPE_B))
+        if (!h->DPB[0].f->buf[0] ||
+            (!h->DPB[1].f->buf[0] && h->cur.f->pict_type == AV_PICTURE_TYPE_B)) {
+            av_log(h->avctx, AV_LOG_ERROR, "Invalid reference frame\n");
             return AVERROR_INVALIDDATA;
+        }
     } else {
         h->cur.f->pict_type = AV_PICTURE_TYPE_I;
         if (get_bits1(&h->gb)) {    //time_code
@@ -1124,6 +1165,8 @@ static int decode_pic(AVSContext *h)
     if ((ret = ff_cavs_init_pic(h)) < 0)
         return ret;
     h->cur.poc = get_bits(&h->gb, 8) * 2;
+    av_log(h->avctx, AV_LOG_DEBUG, "poc=%d, type=%d\n",
+            h->cur.poc, h->cur.f->pict_type);
 
     /* get temporal distances and MV scaling factors */
     if (h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
@@ -1137,6 +1180,8 @@ static int decode_pic(AVSContext *h)
     if (h->cur.f->pict_type == AV_PICTURE_TYPE_B) {
         h->sym_factor = h->dist[0] * h->scale_den[1];
         if (FFABS(h->sym_factor) > 32768) {
+            av_log(h->avctx, AV_LOG_ERROR, "poc=%d/%d/%d, dist=%d/%d\n",
+                    h->DPB[1].poc, h->DPB[0].poc, h->cur.poc, h->dist[0], h->dist[1]);
             av_log(h->avctx, AV_LOG_ERROR, "sym_factor %d too large\n", h->sym_factor);
             return AVERROR_INVALIDDATA;
         }
@@ -1250,11 +1295,6 @@ static int decode_pic(AVSContext *h)
         } while (ff_cavs_next_mb(h));
     }
     emms_c();
-    if (ret >= 0 && h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
-        av_frame_unref(h->DPB[1].f);
-        FFSWAP(AVSFrame, h->cur, h->DPB[1]);
-        FFSWAP(AVSFrame, h->DPB[0], h->DPB[1]);
-    }
     return ret;
 }
 
@@ -1337,11 +1377,12 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
     const uint8_t *buf_ptr;
     int frame_start = 0;
 
-    if (buf_size == 0) {
-        if (!h->low_delay && h->DPB[0].f->data[0]) {
-            *got_frame = 1;
-            av_frame_move_ref(rframe, h->DPB[0].f);
+    if (avpkt->size == 0) {
+        if (h->DPB[0].f->buf[0] && !h->DPB[0].outputed) {
+            queue_one_frame(h, &h->DPB[0]);
+            cavs_frame_unref(&h->DPB[0]);
         }
+        output_one_frame(h, rframe, got_frame);
         return 0;
     }
 
@@ -1364,8 +1405,8 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
             break;
         case PIC_I_START_CODE:
             if (!h->got_keyframe) {
-                av_frame_unref(h->DPB[0].f);
-                av_frame_unref(h->DPB[1].f);
+                cavs_frame_unref(&h->DPB[0]);
+                cavs_frame_unref(&h->DPB[1]);
                 h->got_keyframe = 1;
             }
         case PIC_PB_START_CODE:
@@ -1375,23 +1416,39 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
             if (*got_frame)
                 av_frame_unref(rframe);
             *got_frame = 0;
-            if (!h->got_keyframe)
+            if (!h->got_keyframe) {
+                av_log(avctx, AV_LOG_ERROR, "No keyframe decoded before P/B frame.\n");
                 break;
+            }
             init_get_bits(&h->gb, buf_ptr, input_size);
             h->stc = stc;
-            if (decode_pic(h))
-                break;
-            *got_frame = 1;
+            if ((ret = decode_pic(h)) < 0)
+                return ret;
+            buf_ptr = align_get_bits(&h->gb);
+
+            h->cur.outputed = 0;
             if (h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
-                if (h->DPB[!h->low_delay].f->data[0]) {
-                    if ((ret = av_frame_ref(rframe, h->DPB[!h->low_delay].f)) < 0)
-                        return ret;
-                } else {
-                    *got_frame = 0;
+                // at most one delay
+                if (h->DPB[0].f->buf[0] && !h->DPB[0].outputed) {
+                    queue_one_frame(h, &h->DPB[0]);
+                    h->DPB[0].outputed = 1;
                 }
+
+                if (h->low_delay) {
+                    queue_one_frame(h, &h->cur);
+                    h->cur.outputed = 1;
+                }
+
+                // null -> curr -> DPB[0] -> DPB[1]
+                cavs_frame_unref(&h->DPB[1]);
+                FFSWAP(AVSFrame, h->cur, h->DPB[1]);
+                FFSWAP(AVSFrame, h->DPB[0], h->DPB[1]);
             } else {
-                av_frame_move_ref(rframe, h->cur.f);
+                queue_one_frame(h, &h->cur);
+                cavs_frame_unref(&h->cur);
             }
+
+            output_one_frame(h, rframe, got_frame);
             break;
         case EXT_START_CODE:
             //mpeg_decode_extension(avctx, buf_ptr, input_size);

@@ -167,10 +167,14 @@ typedef struct AVSFrame {
     AVFrame *f;
     int poc;
     int outputed;
+
+    AVBufferRef   *hwaccel_priv_buf;
+    void          *hwaccel_picture_private;
 } AVSFrame;
 
 typedef struct AVSContext {
     AVCodecContext *avctx;
+    int got_pix_fmt;
     BlockDSPContext bdsp;
     H264ChromaContext h264chroma;
     VideoDSPContext vdsp;

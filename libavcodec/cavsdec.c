@@ -25,11 +25,14 @@
  * @author Stefan Gehrer <stefan.gehrer@gmx.de>
  */
 
+#include "config_components.h"
 #include "libavutil/avassert.h"
 #include "libavutil/emms.h"
 #include "avcodec.h"
 #include "get_bits.h"
 #include "golomb.h"
+#include "hwaccel_internal.h"
+#include "hwconfig.h"
 #include "profiles.h"
 #include "cavs.h"
 #include "codec_internal.h"
@@ -1002,9 +1005,9 @@ static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
             }
             h->mb_weight_pred_flag = get_bits1(gb);
             if (!h->avctx->hwaccel) {
-            av_log(h->avctx, AV_LOG_ERROR,
-                   "weighted prediction not yet supported\n");
-        }
+                av_log(h->avctx, AV_LOG_ERROR,
+                    "weighted prediction not yet supported\n");
+            }
         }
     }
     if (h->aec_flag) {
@@ -1115,6 +1118,46 @@ static inline int check_for_slice(AVSContext *h)
  * frame level
  *
  ****************************************************************************/
+static int hwaccel_pic(AVSContext *h)
+{
+    int ret = 0;
+    int stc = -1;
+    const uint8_t *frm_start = align_get_bits(&h->gb);
+    const uint8_t *frm_end = h->gb.buffer_end;
+    const uint8_t *slc_start = frm_start;
+    const uint8_t *slc_end = frm_end;
+    GetBitContext gb = h->gb;
+    const FFHWAccel *hwaccel = ffhwaccel(h->avctx->hwaccel);
+
+    ret = hwaccel->start_frame(h->avctx, NULL, 0);
+    if (ret < 0)
+        return ret;
+
+    for (slc_start = frm_start; slc_start + 4 < frm_end; slc_start = slc_end) {
+        slc_end = avpriv_find_start_code(slc_start + 4, frm_end, &stc);
+        if (slc_end < frm_end) {
+            slc_end -= 4;
+        }
+
+        init_get_bits(&h->gb, slc_start, (slc_end - slc_start) * 8);
+        if (!check_for_slice(h)) {
+            break;
+        }
+
+        ret = hwaccel->decode_slice(h->avctx, slc_start, slc_end - slc_start);
+        if (ret < 0) {
+            break;
+        }
+    }
+
+    h->gb = gb;
+    skip_bits(&h->gb, (slc_start - frm_start) * 8);
+
+    if (ret < 0)
+        return ret;
+
+    return hwaccel->end_frame(h->avctx);
+}
 
 /**
  * @brief remove frame out of dpb
@@ -1124,6 +1167,9 @@ static void cavs_frame_unref(AVSFrame *frame)
     /* frame->f can be NULL if context init failed */
     if (!frame->f || !frame->f->buf[0])
         return;
+
+    av_buffer_unref(&frame->hwaccel_priv_buf);
+    frame->hwaccel_picture_private = NULL;
 
     av_frame_unref(frame->f);
 }
@@ -1219,6 +1265,17 @@ static int decode_pic(AVSContext *h)
     if (ret < 0)
         return ret;
 
+    if (h->avctx->hwaccel) {
+        const FFHWAccel *hwaccel = ffhwaccel(h->avctx->hwaccel);
+        av_assert0(!h->cur.hwaccel_picture_private);
+        if (hwaccel->frame_priv_data_size) {
+            h->cur.hwaccel_priv_buf = av_buffer_allocz(hwaccel->frame_priv_data_size);
+            if (!h->cur.hwaccel_priv_buf)
+                return AVERROR(ENOMEM);
+            h->cur.hwaccel_picture_private = h->cur.hwaccel_priv_buf->data;
+        }
+    }
+
     if (!h->edge_emu_buffer) {
         int alloc_size = FFALIGN(FFABS(h->cur.f->linesize[0]) + 32, 32);
         h->edge_emu_buffer = av_mallocz(alloc_size * 2 * 24);
@@ -1247,7 +1304,9 @@ static int decode_pic(AVSContext *h)
             av_log(h->avctx, AV_LOG_ERROR, "poc=%d/%d/%d, dist=%d/%d\n",
                     h->DPB[1].poc, h->DPB[0].poc, h->cur.poc, h->dist[0], h->dist[1]);
             av_log(h->avctx, AV_LOG_ERROR, "sym_factor %d too large\n", h->sym_factor);
-            return AVERROR_INVALIDDATA;
+
+            if (!h->avctx->hwaccel)
+                return AVERROR_INVALIDDATA;
         }
     } else {
         h->direct_den[0] = h->dist[0] ? 16384 / h->dist[0] : 0;
@@ -1332,7 +1391,9 @@ static int decode_pic(AVSContext *h)
     }
 
     ret = 0;
-    if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
+    if (h->avctx->hwaccel) {
+        ret = hwaccel_pic(h);
+    } else if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
         do {
             check_for_slice(h);
             ret = decode_mb_i(h, 0);
@@ -1503,6 +1564,20 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                 return ret;
             avctx->profile = h->profile;
             avctx->level = h->level;
+            if (!h->got_pix_fmt) {
+                h->got_pix_fmt = 1;
+                ret = ff_get_format(avctx, avctx->codec->pix_fmts);
+                if (ret < 0)
+                    return ret;
+
+                avctx->pix_fmt = ret;
+
+                if (h->profile == AV_PROFILE_CAVS_GUANGDIAN && !avctx->hwaccel) {
+                    av_log(avctx, AV_LOG_ERROR, "Your platform doesn't suppport hardware"
+                                    " accelerated for CAVS Guangdian Profile decoding.\n");
+                    return AVERROR(ENOTSUP);
+                }
+            }
             break;
         case PIC_I_START_CODE:
             if (!h->got_keyframe) {
@@ -1577,6 +1652,14 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
     return (buf_ptr - avpkt->data);
 }
 
+static const enum AVPixelFormat cavs_hwaccel_pixfmt_list_420[] = {
+#if CONFIG_CAVS_VAAPI_HWACCEL
+    AV_PIX_FMT_VAAPI,
+#endif
+    AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_NONE
+};
+
 const FFCodec ff_cavs_decoder = {
     .p.name         = "cavs",
     CODEC_LONG_NAME("Chinese AVS (Audio Video Standard) (AVS1-P2, JiZhun profile)"),
@@ -1589,4 +1672,12 @@ const FFCodec ff_cavs_decoder = {
     .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
     .flush          = cavs_flush,
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+    .p.pix_fmts     = cavs_hwaccel_pixfmt_list_420,
+    .hw_configs     = (const AVCodecHWConfigInternal *const []) {
+#if CONFIG_CAVS_VAAPI_HWACCEL
+                        HWACCEL_VAAPI(cavs),
+#endif
+                        NULL
+                    },
+    .p.profiles     = NULL_IF_CONFIG_SMALL(ff_cavs_profiles),
 };

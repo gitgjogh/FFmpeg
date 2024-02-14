@@ -89,5 +89,6 @@ extern const struct FFHWAccel ff_wmv3_dxva2_hwaccel;
 extern const struct FFHWAccel ff_wmv3_nvdec_hwaccel;
 extern const struct FFHWAccel ff_wmv3_vaapi_hwaccel;
 extern const struct FFHWAccel ff_wmv3_vdpau_hwaccel;
+extern const struct FFHWAccel ff_cavs_vaapi_hwaccel;
 
 #endif /* AVCODEC_HWACCELS_H */

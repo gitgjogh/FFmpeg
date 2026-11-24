@@ -605,9 +605,15 @@ static inline void mv_pred_sym(AVSContext *h, cavs_vector *src,
     dst->dist    = h->dist[dst->ref];
     dst->ref_idx = 0;               /* derived, not read (clause 9.4.5) */
     factor = dst->dist * h->scale_den[src->ref];
-    /* backward mv is the scaled and negated forward mv */
-    dst->x = -((src->x * factor + 256) >> 9);
-    dst->y = -((src->y * factor + 256) >> 9);
+    /* backward mv is the scaled and negated forward mv; the product can
+     * exceed INT_MAX with a wrapped picture distance, truncate to int32
+     * for the defined wraparound of the reference decoder */
+    {
+        int32_t px = (int32_t)((int64_t)src->x * factor);
+        int32_t py = (int32_t)((int64_t)src->y * factor);
+        dst->x = -(int)(((int64_t)px + 256) >> 9);
+        dst->y = -(int)(((int64_t)py + 256) >> 9);
+    }
     set_mvs(dst, size);
 }
 
@@ -2084,7 +2090,6 @@ static int set_ref_list(AVSContext *h)
     const int poc  = h->cur.poc;
     const int poc0 = h->DPB[0].poc;
     const int poc1 = h->DPB[1].poc;
-    int nref;
 
 #define SET_REF(idx, frame, par, distance)      \
     do {                                        \
@@ -2102,12 +2107,10 @@ static int set_ref_list(AVSContext *h)
             SET_REF(i, h->DPB[1].f, 0, poc - poc1);
         /* figure 18: a B frame codes no reference index */
         h->ref_base[0] = b;
-        nref = 1;
     } else if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
         /* figure 14: the second field references its own first field */
         for (int i = 0; i < FF_ARRAY_ELEMS(h->ref); i++)
             SET_REF(i, h->cur.f, f1, 1);
-        nref = 1;
     } else if (!b) {
         if (!h->field) {
             /* figure 16: the four fields of the two previous frames */
@@ -2122,7 +2125,6 @@ static int set_ref_list(AVSContext *h)
             SET_REF(2, h->DPB[0].f, f1, poc - poc0 + 1);
             SET_REF(3, h->DPB[1].f, f2, poc - poc1);
         }
-        nref = 4;
     } else {
         /* figures 19 and 20: two backward and two forward fields */
         SET_REF(0, h->DPB[0].f, f1, poc0     - poc - h->field);
@@ -2130,25 +2132,12 @@ static int set_ref_list(AVSContext *h)
         SET_REF(2, h->DPB[1].f, f2, poc + h->field - poc1 - 1);
         SET_REF(3, h->DPB[1].f, f1, poc + h->field - poc1);
         h->ref_base[0] = 2;
-        nref = 2;
     }
 #undef SET_REF
 
     for (int i = 0; i < FF_ARRAY_ELEMS(h->ref); i++)
         h->scale_den[i] = h->dist[i] ? 512 / h->dist[i] : 0;
 
-    for (int i = 0; b && i < nref; i++) {
-        int fw     = h->ref_base[0] + i;
-        int bw     = h->pic_structure ? h->ref_base[1]
-                                      : h->ref_base[1] + 1 - i;
-        int factor = h->dist[bw] * h->scale_den[fw];
-
-        if (factor > 32768) {
-            av_log(h->avctx, AV_LOG_ERROR,
-                   "symmetric scaling factor %d too large\n", factor);
-            return AVERROR_INVALIDDATA;
-        }
-    }
     return 0;
 }
 

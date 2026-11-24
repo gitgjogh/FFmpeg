@@ -2027,15 +2027,17 @@ static inline int check_for_slice(AVSContext *h)
         int stc;
 
         align = (-get_bits_count(gb)) & 7;
-        /* check for stuffing byte */
-        if (!align && (show_bits(gb, 8) == 0x80))
-            align = 8;
-        if ((show_bits_long(gb, 24 + align) & 0xFFFFFF) != 0x000001)
-            return 0;
-        if (!is_start_code_offset(h, (get_bits_count(gb) + align) >> 3))
-            return 0;
+        /* skip stuffing: alignment zero bits, then any 0x80 stuffing
+         * bytes (each is the '1' stuffing bit plus seven zero bits) */
         peek = *gb;
-        skip_bits_long(&peek, 24 + align);
+        skip_bits(&peek, align);
+        while (show_bits(&peek, 8) == 0x80)
+            skip_bits(&peek, 8);
+        if ((show_bits_long(&peek, 24) & 0xFFFFFF) != 0x000001)
+            return 0;
+        if (!is_start_code_offset(h, get_bits_count(&peek) >> 3))
+            return 0;
+        skip_bits_long(&peek, 24);
         stc = get_bits(&peek, 8);
         if (stc > (SLICE_MAX_START_CODE & 0xFF)) {
             /* video_sequence() places extension_and_user_data(1) between

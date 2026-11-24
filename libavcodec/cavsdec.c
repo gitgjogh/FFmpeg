@@ -2203,6 +2203,7 @@ static int decode_pic(AVSContext *h)
     }
 
     av_frame_unref(h->cur.f);
+    h->cur.already_output = 0;
 
     skip_bits(&h->gb, 16);//bbv_delay
     if (h->profile == AV_PROFILE_CAVS_BROADCASTING)
@@ -2710,9 +2711,10 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
     int frame_start = 0;
 
     if (buf_size == 0) {
-        if (!h->low_delay && h->DPB[0].f->data[0]) {
+        if (h->DPB[0].f->data[0] && !h->DPB[0].already_output) {
             *got_frame = 1;
             av_frame_move_ref(rframe, h->DPB[0].f);
+            h->DPB[0].already_output = 1;
         }
         return 0;
     }
@@ -2768,9 +2770,19 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                 return ret;
             *got_frame = 1;
             if (h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
-                if (h->DPB[!h->low_delay].f->data[0]) {
-                    if ((ret = av_frame_ref(rframe, h->DPB[!h->low_delay].f)) < 0)
+                /* the display queue is one deep: output the backlog frame
+                 * first, then the current one when it is due (immediately
+                 * for low_delay, one picture late otherwise) */
+                AVSFrame *out = NULL;
+                if (h->DPB[1].f->data[0] && !h->DPB[1].already_output)
+                    out = &h->DPB[1];
+                else if (h->low_delay && h->DPB[0].f->data[0] &&
+                         !h->DPB[0].already_output)
+                    out = &h->DPB[0];
+                if (out) {
+                    if ((ret = av_frame_ref(rframe, out->f)) < 0)
                         return ret;
+                    out->already_output = 1;
                 } else {
                     *got_frame = 0;
                 }

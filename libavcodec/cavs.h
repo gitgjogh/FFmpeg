@@ -172,6 +172,7 @@ struct dec_2dvlc {
 typedef struct AVSFrame {
     AVFrame *f;
     int poc;
+    int already_output; ///< already returned to the caller
 } AVSFrame;
 
 typedef struct AVSContext {

@@ -24,16 +24,29 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/cpu.h"
+#include "libavutil/mem_internal.h"
 #include "libavutil/x86/cpu.h"
 #include "libavcodec/cavsdsp.h"
 #include "libavcodec/idctdsp.h"
 #include "fpel.h"
+#include "idctdsp.h"
 #include "config.h"
 
 
-#if HAVE_SSE2_EXTERNAL
+#if HAVE_SSE2_EXTERNAL && ARCH_X86_64
 
-void ff_cavs_idct8_add_sse2(uint8_t *dst, int16_t *block, ptrdiff_t stride);
+void ff_cavs_idct8_sse2(int16_t *out, const int16_t *in);
+
+static void cavs_idct8_add_sse2(uint8_t *dst, int16_t *block, ptrdiff_t stride)
+{
+    LOCAL_ALIGNED(16, int16_t, b2, [64]);
+    ff_cavs_idct8_sse2(b2, block);
+    ff_add_pixels_clamped_sse2(b2, dst, stride);
+}
+
+#endif /* HAVE_SSE2_EXTERNAL && ARCH_X86_64 */
+
+#if HAVE_SSE2_EXTERNAL
 
 #define DEF_QPEL(OPNAME) \
     void ff_ ## OPNAME ## _cavs_qpel8_mc20_sse2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride);     \
@@ -103,8 +116,17 @@ av_cold void ff_cavsdsp_init_x86(CAVSDSPContext *c)
         c->avg_cavs_qpel_pixels_tab[1][ 8] = ff_avg_cavs_qpel8_mc02_sse2;
         c->avg_cavs_qpel_pixels_tab[1][12] = ff_avg_cavs_qpel8_mc03_sse2;
 
-        c->cavs_idct8_add = ff_cavs_idct8_add_sse2;
-        c->idct_perm      = FF_IDCT_PERM_LIBMPEG2;
+#if ARCH_X86_64
+        /* The SSE2 IDCT uses 32-bit intermediates and packssdw for the int16
+         * clipping of the row/column results, so it is bit-exact with the C
+         * version (and the rm52k reference) for the full int16 input range. */
+        c->cavs_idct8_add = cavs_idct8_add_sse2;
+        c->idct_perm      = FF_IDCT_PERM_TRANSPOSE;
+#else
+        /* 32-bit x86 lacks the 16 xmm registers the exact SSE2 IDCT kernel
+         * needs; keep the C IDCT there. */
+        c->idct_perm      = FF_IDCT_PERM_NONE;
+#endif
     }
 #endif
 }

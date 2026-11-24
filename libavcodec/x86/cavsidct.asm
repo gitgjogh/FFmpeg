@@ -18,151 +18,263 @@
 ; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 ; Lesser General Public License for more details.
 ;
-; You should have received a copy of the GNU Lesser General Public License
-; along with FFmpeg; if not, write to the Free Software Foundation,
-; Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+; You should have received a copy of the GNU Lesser General Public
+; License along with FFmpeg; if not, write to the Free Software
+; Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 %include "libavutil/x86/x86util.asm"
 
-SECTION_RODATA
-
-; Horizontal pass. A line is stored as src0 src2 src4 src6 src1 src3 src5 src7
-; (FF_IDCT_PERM_LIBMPEG2). row_xy_01 holds the weights of srcx and srcy in
-; out0 (low half) and out1 (high half), doubled for two lines at once.
-row_02_01: dw  8,  10,  8,  10,   8,   4,   8,   4
-row_02_23: dw  8,  -4,  8,  -4,   8, -10,   8, -10
-row_46_01: dw  8,   4,  8,   4,  -8, -10,  -8, -10
-row_46_23: dw -8,  10, -8,  10,   8,  -4,   8,  -4
-row_13_01: dw 10,   9, 10,   9,   9,  -2,   9,  -2
-row_13_23: dw  6, -10,  6, -10,   2,  -6,   2,  -6
-row_57_01: dw  6,   2,  6,   2, -10,  -6, -10,  -6
-row_57_23: dw  2,   9,  2,   9,   9, -10,   9, -10
-
-; Vertical pass, on the interleaved words of lines n and n+4.
-pw_8_8:    times 4 dw   8,   8
-pw_8_m8:   times 4 dw   8,  -8
-pw_10_4:   times 4 dw  10,   4
-pw_4_m10:  times 4 dw   4, -10
-pw_10_6:   times 4 dw  10,   6
-pw_9_2:    times 4 dw   9,   2
-pw_9_m10:  times 4 dw   9, -10
-pw_m2_m6:  times 4 dw  -2,  -6
-pw_6_2:    times 4 dw   6,   2
-pw_m10_9:  times 4 dw -10,   9
-pw_2_9:    times 4 dw   2,   9
-pw_m6_m10: times 4 dw  -6, -10
-
-pw_8_0:    times 4 dw   8,   0
-pd_4:      times 4 dd   4
-
-cextern pb_0
+SECTION_RODATA 32
+pd_4:  times 4 dd 4
+pd_64: times 4 dd 64
 
 SECTION .text
 
-; Horizontal pass of lines %1 and %1+4. Line %1 gets the two lines' words
-; of columns 0-3 interleaved, line %1+4 those of columns 4-7.
-%macro CAVS_IDCT8_ROWS 1
-    mova            m1, [blockq+(%1)*16]
-    punpckldq       m0, m1, [blockq+(%1)*16+64] ; src0 src2 x2, src4 src6 x2
-    punpckhdq       m1, [blockq+(%1)*16+64]     ; src1 src3 x2, src5 src7 x2
-    pshufd          m2, m0, q1010
-    pshufd          m0, m0, q3232
-    pmaddwd         m3, m2, [row_02_23]
-    pmaddwd         m2, [row_02_01]
-    pmaddwd         m4, m0, [row_46_23]
-    pmaddwd         m0, [row_46_01]
-    paddd           m2, m0              ; even part of out0 and out1
-    paddd           m3, m4              ; even part of out2 and out3
-    pshufd          m0, m1, q1010
-    pshufd          m1, m1, q3232
-    pmaddwd         m4, m0, [row_13_23]
-    pmaddwd         m0, [row_13_01]
-    pmaddwd         m5, m1, [row_57_23]
-    pmaddwd         m1, [row_57_01]
-    paddd           m0, m1              ; odd part of out0 and out1
-    paddd           m4, m5              ; odd part of out2 and out3
-    paddd           m2, [pd_4]
-    paddd           m3, [pd_4]
-    psubd           m1, m2, m0          ; out7 out6
-    psubd           m5, m3, m4          ; out5 out4
-    paddd           m2, m0              ; out0 out1
-    paddd           m3, m4              ; out2 out3
-    packssdw        m2, m3              ; the clip to 16 bits
-    packssdw        m5, m1
-    pshufd          m5, m5, q2301       ; out4 out5 out6 out7
-    psraw           m2, 3
-    psraw           m5, 3
-%if %1 == 0
-    paddw           m2, [pw_8_0]        ; rounding of the vertical pass,
-    paddw           m5, [pw_8_0]        ; which multiplies line 0 by 8
+; 1D CAVS inverse transform of one 4-column chunk with 32-bit intermediates,
+; bit-exact with the C code (which matches the rm52k reference decoder).
+; The 16-bit SSE2 version this replaces wrapped around on the large
+; coefficients that occur in conformance streams; doing all arithmetic in
+; the dword domain and relying on packssdw for the int16 clipping of the
+; row/column results makes the kernel exact for the full int16 input range.
+;
+; %1 = word matrix base, %2 = chunk byte offset (0 = columns 0-3, 8 = 4-7),
+; %3 = pass (1 = row pass with +4 rounding, 2 = column pass with +64 rounding)
+; outputs (dwords): m0 = out0, m3 = out1, m4 = out2, m5 = out3,
+;                   m13 = out4, m14 = out5, m1 = out6, m2 = out7
+%macro CAVS_IDCT8_1D_32 3
+    movq      m4, [%1 + 7*16 + %2]      ; s7
+    movq      m5, [%1 + 1*16 + %2]      ; s1
+    movq      m2, [%1 + 5*16 + %2]      ; s5
+    movq      m7, [%1 + 3*16 + %2]      ; s3
+    punpcklwd m4, m4
+    punpcklwd m5, m5
+    punpcklwd m2, m2
+    punpcklwd m7, m7
+    psrad     m4, 16                    ; sign-extend words to dwords
+    psrad     m5, 16
+    psrad     m2, 16
+    psrad     m7, 16
+
+    ; a0 = 3*s1 - 2*s7, a1 = 3*s3 + 2*s5
+    ; a2 = 2*s3 - 3*s5, a3 = 2*s1 + 3*s7
+    mova      m9,  m5
+    pslld     m9,  1                    ; 2*s1
+    mova      m10, m4
+    pslld     m10, 1                    ; 2*s7
+    mova      m11, m7
+    pslld     m11, 1                    ; 2*s3
+    mova      m12, m2
+    pslld     m12, 1                    ; 2*s5
+    mova      m0,  m5
+    paddd     m0,  m9
+    psubd     m0,  m10                  ; a0
+    mova      m1,  m7
+    paddd     m1,  m11
+    paddd     m1,  m12                  ; a1
+    mova      m3,  m2
+    paddd     m3,  m12                  ; 3*s5
+    mova      m8,  m11                  ; 2*s3
+    psubd     m8,  m3                   ; a2
+    mova      m3,  m4
+    paddd     m3,  m10                  ; 3*s7
+    paddd     m3,  m9                   ; a3
+
+    ; b4 = 2*(a0+a1+a3)+a1, b5 = 2*(a0-a1+a2)+a0
+    ; b6 = 2*(a3-a2-a1)+a3, b7 = 2*(a0-a2-a3)-a2
+    mova      m9,  m0
+    paddd     m9,  m1
+    paddd     m9,  m3
+    pslld     m9,  1
+    paddd     m9,  m1                   ; b4
+    mova      m10, m0
+    psubd     m10, m1
+    paddd     m10, m8
+    pslld     m10, 1
+    paddd     m10, m0                   ; b5
+    mova      m11, m3
+    psubd     m11, m8
+    psubd     m11, m1
+    pslld     m11, 1
+    paddd     m11, m3                   ; b6
+    mova      m12, m0
+    psubd     m12, m8
+    psubd     m12, m3
+    pslld     m12, 1
+    psubd     m12, m8                   ; b7
+
+    ; load even rows: s0 -> m4, s4 -> m5, s2 -> m2, s6 -> m7
+    movq      m4, [%1 + 0*16 + %2]
+    movq      m5, [%1 + 4*16 + %2]
+    movq      m2, [%1 + 2*16 + %2]
+    movq      m7, [%1 + 6*16 + %2]
+    punpcklwd m4, m4
+    punpcklwd m5, m5
+    punpcklwd m2, m2
+    punpcklwd m7, m7
+    psrad     m4, 16
+    psrad     m5, 16
+    psrad     m2, 16
+    psrad     m7, 16
+
+    ; a4 = 8*(s0+s4), a5 = 8*(s0-s4)  (+4 rounding on the row pass)
+    mova      m13, m4
+    paddd     m13, m5
+    pslld     m13, 3                    ; a4
+    mova      m14, m4
+    psubd     m14, m5
+    pslld     m14, 3                    ; a5
+%if %3 == 1
+    paddd     m13, [pd_4]
+    paddd     m14, [pd_4]
 %endif
-    mova [blockq+(%1)*16], m2
-    mova [blockq+(%1)*16+64], m5
+
+    ; a6 = 4*s6 + 10*s2, a7 = 4*s2 - 10*s6
+    mova      m15, m2
+    pslld     m15, 2                    ; 4*s2
+    mova      m8,  m7
+    pslld     m8,  2                    ; 4*s6
+    mova      m0,  m2
+    pslld     m0,  1                    ; 2*s2
+    mova      m1,  m2
+    pslld     m1,  3
+    paddd     m1,  m0                   ; 10*s2
+    mova      m3,  m7
+    pslld     m3,  1                    ; 2*s6
+    mova      m0,  m7
+    pslld     m0,  3
+    paddd     m0,  m3                   ; 10*s6
+    paddd     m1,  m8                   ; a6
+    psubd     m15, m0                   ; a7
+
+    ; b0 = a4+a6, b1 = a5+a7, b2 = a5-a7, b3 = a4-a6
+    mova      m0,  m13
+    paddd     m0,  m1                   ; b0
+    psubd     m13, m1                   ; b3
+    mova      m1,  m14
+    paddd     m1,  m15                  ; b1
+    psubd     m14, m15                  ; b2
+
+    ; out0 = b0+b4, out7 = b0-b4, out1 = b1+b5, out6 = b1-b5
+    ; out2 = b2+b6, out5 = b2-b6, out3 = b3+b7, out4 = b3-b7
+    mova      m2,  m0
+    paddd     m0,  m9                   ; out0
+    psubd     m2,  m9                   ; out7
+    mova      m3,  m1
+    paddd     m3,  m10                  ; out1
+    psubd     m1,  m10                  ; out6
+    mova      m4,  m14
+    paddd     m4,  m11                  ; out2
+    psubd     m14, m11                  ; out5
+    mova      m5,  m13
+    paddd     m5,  m12                  ; out3
+    psubd     m13, m12                  ; out4
+%if %3 == 2
+    paddd     m0,  [pd_64]
+    paddd     m3,  [pd_64]
+    paddd     m4,  [pd_64]
+    paddd     m5,  [pd_64]
+    paddd     m13, [pd_64]
+    paddd     m14, [pd_64]
+    paddd     m1,  [pd_64]
+    paddd     m2,  [pd_64]
+%endif
 %endmacro
 
-; Even part of the vertical pass: m0 and m4 get %1 + %2 and %1 - %2 of
-; columns 0-3, m2 and m5 those of columns 4-7.
-%macro CAVS_IDCT8_EVEN 2
-    mova            m0, [blockq+0*16]
-    mova            m1, [blockq+2*16]
-    mova            m2, [blockq+0*16+64]
-    mova            m3, [blockq+2*16+64]
-    pmaddwd         m0, [%1]
-    pmaddwd         m1, [%2]
-    pmaddwd         m2, [%1]
-    pmaddwd         m3, [%2]
-    psubd           m4, m0, m1
-    psubd           m5, m2, m3
-    paddd           m0, m1
-    paddd           m2, m3
-%endmacro
-
-; Add lines n and 7-n to the picture: even part in m%1 (columns 0-3) and
-; m%2 (columns 4-7), odd part weights %3 and %4, line addresses %5 and %6.
-%macro CAVS_IDCT8_OUT 6
-    mova            m1, [blockq+1*16]
-    mova            m3, [blockq+3*16]
-    pmaddwd         m1, [%3]
-    pmaddwd         m3, [%4]
-    paddd           m1, m3
-    psubd           m3, m%1, m1
-    paddd          m%1, m1
-    mova            m1, [blockq+1*16+64]
-    mova            m6, [blockq+3*16+64]
-    pmaddwd         m1, [%3]
-    pmaddwd         m6, [%4]
-    paddd           m1, m6
-    psubd           m6, m%2, m1
-    paddd          m%2, m1
-    packssdw       m%1, m%2             ; the clip to 16 bits
-    packssdw        m3, m6
-    psraw          m%1, 7
-    psraw           m3, 7
-    movq            m1, [%5]
-    movq            m6, [%6]
-    punpcklbw       m1, [pb_0]
-    punpcklbw       m6, [pb_0]
-    paddw          m%1, m1
-    paddw           m3, m6
-    packuswb       m%1, m3
-    movq          [%5], m%1
-    movhps        [%6], m%1
-%endmacro
-
-; void ff_cavs_idct8_add(uint8_t *dst, int16_t *block, ptrdiff_t stride)
+; the kernel needs all 16 xmm registers, so it is x86-64 only; 32-bit x86
+; keeps the (exact) C version
+%if ARCH_X86_64
 INIT_XMM sse2
-cglobal cavs_idct8_add, 3, 5, 7, dst, block, stride
-    CAVS_IDCT8_ROWS 0
-    CAVS_IDCT8_ROWS 1
-    CAVS_IDCT8_ROWS 2
-    CAVS_IDCT8_ROWS 3
+cglobal cavs_idct8, 2, 2, 16, 16 * 16, out, in
+    ; pass 1 (row pass: +4 rounding, >>3), columns 0-3
+    CAVS_IDCT8_1D_32 inq, 0, 1
+    mova      [rsp +  0*16], m0
+    mova      [rsp +  1*16], m3
+    mova      [rsp +  2*16], m4
+    mova      [rsp +  3*16], m5
+    mova      [rsp +  4*16], m13
+    mova      [rsp +  5*16], m14
+    mova      [rsp +  6*16], m1
+    mova      [rsp +  7*16], m2
+    ; pass 1, columns 4-7; clip to int16 (packssdw) and shift
+    CAVS_IDCT8_1D_32 inq, 8, 1
+    mova      m8,  [rsp +  0*16]
+    packssdw  m8,  m0
+    psraw     m8,  3                    ; dst0
+    mova      m9,  [rsp +  1*16]
+    packssdw  m9,  m3
+    psraw     m9,  3                    ; dst1
+    mova      m10, [rsp +  2*16]
+    packssdw  m10, m4
+    psraw     m10, 3                    ; dst2
+    mova      m11, [rsp +  3*16]
+    packssdw  m11, m5
+    psraw     m11, 3                    ; dst3
+    mova      m12, [rsp +  4*16]
+    packssdw  m12, m13
+    psraw     m12, 3                    ; dst4
+    mova      m13, [rsp +  5*16]
+    packssdw  m13, m14
+    psraw     m13, 3                    ; dst5
+    mova      m14, [rsp +  6*16]
+    packssdw  m14, m1
+    psraw     m14, 3                    ; dst6
+    mova      m15, [rsp +  7*16]
+    packssdw  m15, m2
+    psraw     m15, 3                    ; dst7
 
-    lea             r3, [strideq*3]
-    lea             r4, [dstq+strideq*4]
-    CAVS_IDCT8_EVEN pw_8_8,  pw_10_4
-    CAVS_IDCT8_OUT  0, 2, pw_10_6,  pw_9_2,    dstq,           r4+r3
-    CAVS_IDCT8_OUT  4, 5, pw_2_9,   pw_m6_m10, dstq+r3,        r4
-    CAVS_IDCT8_EVEN pw_8_m8, pw_4_m10
-    CAVS_IDCT8_OUT  0, 2, pw_9_m10, pw_m2_m6,  dstq+strideq,   r4+strideq*2
-    CAVS_IDCT8_OUT  4, 5, pw_6_2,   pw_m10_9,  dstq+strideq*2, r4+strideq
+    TRANSPOSE8x8W 8, 9, 10, 11, 12, 13, 14, 15, 0
+    mova      [rsp +  0*16], m8
+    mova      [rsp +  1*16], m9
+    mova      [rsp +  2*16], m10
+    mova      [rsp +  3*16], m11
+    mova      [rsp +  4*16], m12
+    mova      [rsp +  5*16], m13
+    mova      [rsp +  6*16], m14
+    mova      [rsp +  7*16], m15
+
+    ; pass 2 (column pass: +64 rounding, >>7), rows 0-3 of the transpose
+    CAVS_IDCT8_1D_32 rsp, 0, 2
+    mova      [rsp +  8*16], m0
+    mova      [rsp +  9*16], m3
+    mova      [rsp + 10*16], m4
+    mova      [rsp + 11*16], m5
+    mova      [rsp + 12*16], m13
+    mova      [rsp + 13*16], m14
+    mova      [rsp + 14*16], m1
+    mova      [rsp + 15*16], m2
+    ; pass 2, rows 4-7 of the transpose; clip, shift and store
+    CAVS_IDCT8_1D_32 rsp, 8, 2
+    mova      m8,  [rsp +  8*16]
+    packssdw  m8,  m0
+    psraw     m8,  7
+    mova      [outq + 0*16], m8
+    mova      m9,  [rsp +  9*16]
+    packssdw  m9,  m3
+    psraw     m9,  7
+    mova      [outq + 1*16], m9
+    mova      m10, [rsp + 10*16]
+    packssdw  m10, m4
+    psraw     m10, 7
+    mova      [outq + 2*16], m10
+    mova      m11, [rsp + 11*16]
+    packssdw  m11, m5
+    psraw     m11, 7
+    mova      [outq + 3*16], m11
+    mova      m12, [rsp + 12*16]
+    packssdw  m12, m13
+    psraw     m12, 7
+    mova      [outq + 4*16], m12
+    mova      m13, [rsp + 13*16]
+    packssdw  m13, m14
+    psraw     m13, 7
+    mova      [outq + 5*16], m13
+    mova      m14, [rsp + 14*16]
+    packssdw  m14, m1
+    psraw     m14, 7
+    mova      [outq + 6*16], m14
+    mova      m15, [rsp + 15*16]
+    packssdw  m15, m2
+    psraw     m15, 7
+    mova      [outq + 7*16], m15
     RET
+%endif

@@ -1964,6 +1964,47 @@ static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
     return 0;
 }
 
+/**
+ * Skip the stuffing following a picture header: optional alignment
+ * zero bits, 0x80 stuffing bytes and the leading zero bytes of the
+ * next start code (some encoders pad pictures with kilobytes of
+ * zeros).  The reader is rewound when no start code follows.
+ * @return 1 if stuffing was skipped, 0 otherwise
+ */
+static inline int skip_stuffing_bits(AVSContext *h)
+{
+    GetBitContext gb0 = h->gb;
+    GetBitContext *gb = &h->gb;
+    const uint8_t *start;
+    const uint8_t *ptr;
+    const uint8_t *end;
+    int align;
+    int stuffing_zeros;
+
+    /* seems like not all the streams follow next_start_code() strictly */
+    align = (-get_bits_count(gb)) & 7;
+    if (align == 0 && show_bits(gb, 8) == 0x80)
+        skip_bits_long(gb, 8);
+
+    /* skip leading zero bytes before 0x000001 stc */
+    ptr = start = align_get_bits(gb);
+    end = gb->buffer + (gb->size_in_bits >> 3);
+    while (ptr < end && *ptr == 0)
+        ptr++;
+
+    if ((ptr >= end) || (*ptr == 1 && ptr - start >= 2)) {
+        stuffing_zeros = (ptr >= end ? end - start : ptr - start - 2);
+        if (stuffing_zeros > 0)
+            av_log(h->avctx, AV_LOG_DEBUG, "Skip 0x%x stuffing zeros @0x%x",
+                   stuffing_zeros, (int)(start - gb->buffer));
+        skip_bits_long(gb, stuffing_zeros * 8);
+        return 1;
+    }
+
+    h->gb = gb0;
+    return 0;
+}
+
 static inline int check_for_slice(AVSContext *h)
 {
     GetBitContext *gb = &h->gb;
@@ -2329,6 +2370,8 @@ static int decode_pic(AVSContext *h)
         }
         h->aec_enable = get_bits1(&h->gb);
     }
+
+    skip_stuffing_bits(h);
 
     /* in a frame picture the field derivations reduce to the frame ones
      * (9.9.1 b) 3)) */

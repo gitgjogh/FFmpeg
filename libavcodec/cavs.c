@@ -548,6 +548,68 @@ static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int parity,
     chroma_op(dest_cr, src_cr, h->c_stride, chroma_height, mx & 7, my_c & 7);
 }
 
+/*****************************************************************************
+ *
+ * weighted prediction
+ *
+ ****************************************************************************/
+
+static inline void cavs_wp_block(uint8_t *dst, ptrdiff_t stride, int width,
+                                 int height, int scale, int shift)
+{
+    int x, y;
+
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++)
+            dst[x] = av_clip_uint8(((dst[x] * scale + 16) >> 5) + shift);
+        dst += stride;
+    }
+}
+
+static inline void cavs_avg_block(uint8_t *dst, const uint8_t *src,
+                                  ptrdiff_t stride, int width, int height)
+{
+    int x, y;
+
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++)
+            dst[x] = (dst[x] + src[x] + 1) >> 1;
+        dst += stride;
+        src += stride;
+    }
+}
+
+/**
+ * apply weighted prediction to one prediction block
+ * @param chroma_width  chroma block width (height is 2x for 4:2:2)
+ * @param idx index into the weight parameter arrays
+ */
+static void cavs_wp_part(AVSContext *h, uint8_t *dest_y, uint8_t *dest_cb,
+                         uint8_t *dest_cr, int chroma_width, int chroma_height,
+                         int idx)
+{
+    int luma_size = chroma_width * 2;
+
+    cavs_wp_block(dest_y,  h->l_stride, luma_size, luma_size,
+                  h->luma_scale[idx], h->luma_shift[idx]);
+    cavs_wp_block(dest_cb, h->c_stride, chroma_width, chroma_height,
+                  h->chroma_scale[idx], h->chroma_shift[idx]);
+    cavs_wp_block(dest_cr, h->c_stride, chroma_width, chroma_height,
+                  h->chroma_scale[idx], h->chroma_shift[idx]);
+}
+
+static inline void cavs_avg_part(AVSContext *h, uint8_t *dest_y, uint8_t *dest_cb,
+                                 uint8_t *dest_cr, const uint8_t *tmp_y,
+                                 const uint8_t *tmp_cb, const uint8_t *tmp_cr,
+                                 int chroma_width, int chroma_height)
+{
+    int luma_size = chroma_width * 2;
+
+    cavs_avg_block(dest_y,  tmp_y,  h->l_stride, luma_size, luma_size);
+    cavs_avg_block(dest_cb, tmp_cb, h->c_stride, chroma_width, chroma_height);
+    cavs_avg_block(dest_cr, tmp_cr, h->c_stride, chroma_width, chroma_height);
+}
+
 static inline void mc_part_std(AVSContext *h, int chroma_height,
                                uint8_t *dest_y,
                                uint8_t *dest_cb,
@@ -561,7 +623,12 @@ static inline void mc_part_std(AVSContext *h, int chroma_height,
 {
     qpel_mc_func *qpix_op =  qpix_put;
     h264_chroma_mc_func chroma_op = chroma_put;
-    /* for 4:2:2 the chroma block keeps the luma block's height */
+    int has_fwd, has_bwd;
+    int fw_idx = 0, bw_idx = 0; ///< weight parameter indexes
+    /* chroma_width keeps the pre-doubled value; for 4:2:2 the chroma
+     * block keeps the luma block's height */
+    const int chroma_width = chroma_height;
+
     chroma_height <<= (h->chroma_format == 2);
 
     dest_y   += x_offset * 2 + y_offset * h->l_stride * 2;
@@ -571,7 +638,44 @@ static inline void mc_part_std(AVSContext *h, int chroma_height,
     /* the row is counted inside the current field (clause 3.24) */
     y_offset += 8 * h->field_mby;
 
-    if (mv->ref >= 0) {
+    has_fwd = mv->ref >= 0;
+    has_bwd = (mv + MV_BWD_OFFS)->ref >= 0;
+
+    if (h->cur.f->pict_type == AV_PICTURE_TYPE_B) {
+        if (!h->pic_structure) {
+            /* field B: the weight sets alternate forward/backward fields */
+            fw_idx = 2 * (mv->ref - h->ref_base[0]);
+            bw_idx = 2 * ((mv + MV_BWD_OFFS)->ref - h->ref_base[1]) + 1;
+        } else {
+            fw_idx = 0;
+            bw_idx = 1;
+        }
+    } else {
+        fw_idx = mv->ref - h->ref_base[0];
+    }
+
+    if (h->mb_weight_pred && has_fwd && has_bwd) {
+        /* weighted bi-prediction: weight each direction separately */
+        mc_dir_part(h, h->ref[mv->ref].f, h->ref[mv->ref].parity,
+                    chroma_height, 0,
+                    h->wp_y, h->wp_u, h->wp_v, x_offset, y_offset,
+                    qpix_put, chroma_put, mv);
+        cavs_wp_part(h, h->wp_y, h->wp_u, h->wp_v,
+                     chroma_width, chroma_height, fw_idx);
+        mc_dir_part(h, h->ref[(mv + MV_BWD_OFFS)->ref].f,
+                    h->ref[(mv + MV_BWD_OFFS)->ref].parity,
+                    chroma_height, 1,
+                    dest_y, dest_cb, dest_cr, x_offset, y_offset,
+                    qpix_put, chroma_put, mv + MV_BWD_OFFS);
+        cavs_wp_part(h, dest_y, dest_cb, dest_cr,
+                     chroma_width, chroma_height, bw_idx);
+        cavs_avg_part(h, dest_y, dest_cb, dest_cr,
+                      h->wp_y, h->wp_u, h->wp_v,
+                      chroma_width, chroma_height);
+        return;
+    }
+
+    if (has_fwd) {
         mc_dir_part(h, h->ref[mv->ref].f, h->ref[mv->ref].parity,
                     chroma_height, 0,
                     dest_y, dest_cb, dest_cr, x_offset, y_offset,
@@ -587,6 +691,15 @@ static inline void mc_part_std(AVSContext *h, int chroma_height,
                     chroma_height, 1,
                     dest_y, dest_cb, dest_cr, x_offset, y_offset,
                     qpix_op, chroma_op, mv);
+    }
+
+    if (h->mb_weight_pred) {
+        if (has_fwd)
+            cavs_wp_part(h, dest_y, dest_cb, dest_cr,
+                         chroma_width, chroma_height, fw_idx);
+        else if (has_bwd)
+            cavs_wp_part(h, dest_y, dest_cb, dest_cr,
+                         chroma_width, chroma_height, bw_idx);
     }
 }
 
@@ -1018,6 +1131,7 @@ av_cold int ff_cavs_end(AVCodecContext *avctx)
     av_freep(&h->col_mv);
     av_freep(&h->col_type_base);
     av_freep(&h->edge_emu_buffer);
+    av_freep(&h->wp_y);
     av_freep(&h->deemulated_buf);
     h->deemulated_buf_size = 0;
     av_freep(&h->stc_offset);

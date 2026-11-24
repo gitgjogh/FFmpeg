@@ -684,6 +684,7 @@ static int decode_residual_block(AVSContext *h, GetBitContext *gb,
 #define AEC_COEFF_FRAME_CHROMA      124
 #define AEC_COEFF_FIELD_LUMA        190
 #define AEC_COEFF_FIELD_CHROMA      256
+#define AEC_MB_WEIGHT_PRED          322
 
 /* a conforming block's quantized coefficients span -2^(n+3)..2^(n+3)-1
  * with n the sample precision, 8 for both profiles (clause 9.6.2) */
@@ -1527,6 +1528,21 @@ static int decode_mb_p(AVSContext *h, enum cavs_mb mb_type)
                mb_type);
         return AVERROR_INVALIDDATA;
     }
+    if (h->slice_weight_pred_flag) {
+        /* skip MBs are never weighted when per-MB weights are signalled */
+        if (h->mb_weight_pred_flag) {
+            if (mb_type != P_SKIP)
+                h->mb_weight_pred = h->aec_enable
+                    ? ff_cavs_aec_decode_decision(&h->aec, AEC_MB_WEIGHT_PRED)
+                    : get_bits1(&h->gb);
+            else
+                h->mb_weight_pred = 0;
+        } else {
+            h->mb_weight_pred = 1;
+        }
+    } else {
+        h->mb_weight_pred = 0;
+    }
     ff_cavs_inter(h, mb_type);
     set_intra_mode_default(h);
     store_mvs(h);
@@ -1707,6 +1723,21 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
                 MV(MV_BWD_X1, MV_BWD_C2, MV_PRED_TOPRIGHT, BLK_8X16, ref[1][1]);
         }
     }
+    if (h->slice_weight_pred_flag) {
+        /* skip MBs are never weighted when per-MB weights are signalled */
+        if (h->mb_weight_pred_flag) {
+            if (mb_type != B_SKIP)
+                h->mb_weight_pred = h->aec_enable
+                    ? ff_cavs_aec_decode_decision(&h->aec, AEC_MB_WEIGHT_PRED)
+                    : get_bits1(&h->gb);
+            else
+                h->mb_weight_pred = 0;
+        } else {
+            h->mb_weight_pred = 1;
+        }
+    } else {
+        h->mb_weight_pred = 0;
+    }
     ff_cavs_inter(h, mb_type);
     set_intra_mode_default(h);
     if (mb_type != B_SKIP) {
@@ -1804,11 +1835,24 @@ static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
     }
     /* inter frame or second slice can have weighting params */
     if ((h->cur.f->pict_type != AV_PICTURE_TYPE_I) ||
-        (!h->pic_structure && h->mbidx >= h->mb_width * h->mb_height / 2))
-        if (get_bits1(gb)) { //slice_weighting_flag
-            avpriv_request_sample(h->avctx, "Weighted prediction");
-            return AVERROR_PATCHWELCOME;
+        (!h->pic_structure && h->mbidx >= h->mb_width * h->mb_height / 2)) {
+        h->slice_weight_pred_flag = get_bits1(gb);
+        if (h->slice_weight_pred_flag) {
+            /* a second I field codes one weight set, a field picture
+             * codes four (one per reference field), a frame two */
+            int nref = h->cur.f->pict_type == AV_PICTURE_TYPE_I ? 1
+                     : !h->pic_structure ? 4 : 2;
+            for (int i = 0; i < nref; i++) {
+                h->luma_scale[i]   = get_bits(gb, 8);
+                h->luma_shift[i]   = get_sbits(gb, 8);
+                skip_bits1(gb);
+                h->chroma_scale[i] = get_bits(gb, 8);
+                h->chroma_shift[i] = get_sbits(gb, 8);
+                skip_bits1(gb);
+            }
+            h->mb_weight_pred_flag = get_bits1(gb);
         }
+    }
     return 0;
 }
 
@@ -2017,6 +2061,17 @@ static int decode_pic(AVSContext *h)
         h->edge_emu_buffer = av_mallocz(alloc_size * 2 * 24);
         if (!h->edge_emu_buffer)
             return AVERROR(ENOMEM);
+    }
+    if (!h->wp_y) {
+        int alloc_size = FFALIGN(FFABS(h->cur.f->linesize[0]) + 32, 32);
+        /* 16 luma rows + 2 x 16 chroma rows (4:2:2) for weighted
+         * bi-prediction; rows may be up to twice the frame stride for
+         * field pictures */
+        h->wp_y = av_mallocz(alloc_size * 2 * 48);
+        if (!h->wp_y)
+            return AVERROR(ENOMEM);
+        h->wp_u = h->wp_y + alloc_size * 2 * 16;
+        h->wp_v = h->wp_u + alloc_size * 2 * 16;
     }
 
     /* picture_distance; DistanceIndex is twice it (clause 9.4.6.1) */

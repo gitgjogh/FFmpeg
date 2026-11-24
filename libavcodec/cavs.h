@@ -222,6 +222,19 @@ typedef struct AVSContext {
     int loop_filter_disable;
     int alpha_offset, beta_offset;
     int ref_flag;
+
+    /** \defgroup slice weighting
+     * @{
+     */
+    uint32_t slice_weight_pred_flag : 1;
+    uint32_t mb_weight_pred_flag    : 1;
+    uint8_t luma_scale[4];
+    int8_t luma_shift[4];
+    uint8_t chroma_scale[4];
+    int8_t chroma_shift[4];
+    /**@}*/
+    int mb_weight_pred;  ///< apply weighted prediction to current MB
+    uint8_t *wp_y, *wp_u, *wp_v; ///< temp buffers for weighted bi-prediction
     int mbx, mby, mbidx; ///< macroblock coordinates
     int flags;         ///< availability flags of neighbouring macroblocks
     int stc;           ///< last start code

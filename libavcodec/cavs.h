@@ -223,6 +223,16 @@ typedef struct AVSContext {
     int alpha_offset, beta_offset;
     int ref_flag;
 
+    /** \defgroup Guangdian weighting quantisation
+     * @{
+     */
+    int weight_quant_flag;
+    int chroma_quant_param_disable;
+    int chroma_quant_param_delta_cb;
+    int chroma_quant_param_delta_cr;
+    uint8_t wqm_8x8[64];
+    /**@}*/
+
     /** \defgroup slice weighting
      * @{
      */

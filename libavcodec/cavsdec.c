@@ -61,6 +61,53 @@ static const uint8_t cbp_tab[64][2] = {
 
 static const uint8_t scan3x3[4] = { 4, 5, 7, 8 };
 
+static const uint8_t default_wq_param[4][6] = {
+    {128,  98, 106, 116, 116, 128},
+    {135, 143, 143, 160, 160, 213},
+    {128,  98, 106, 116, 116, 128},
+    {128, 128, 128, 128, 128, 128},
+};
+static const uint8_t wq_model_2_param[4][64] = {
+    {
+        0, 0, 0, 4, 4, 4, 5, 5,
+        0, 0, 3, 3, 3, 3, 5, 5,
+        0, 3, 2, 2, 1, 1, 5, 5,
+        4, 3, 2, 2, 1, 5, 5, 5,
+        4, 3, 1, 1, 5, 5, 5, 5,
+        4, 3, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }, {
+        0, 0, 0, 4, 4, 4, 5, 5,
+        0, 0, 4, 4, 4, 4, 5, 5,
+        0, 3, 2, 2, 2, 1, 5, 5,
+        3, 3, 2, 2, 1, 5, 5, 5,
+        3, 3, 2, 1, 5, 5, 5, 5,
+        3, 3, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }, {
+        0, 0, 0, 4, 4, 3, 5, 5,
+        0, 0, 4, 4, 3, 2, 5, 5,
+        0, 4, 4, 3, 2, 1, 5, 5,
+        4, 4, 3, 2, 1, 5, 5, 5,
+        4, 3, 2, 1, 5, 5, 5, 5,
+        3, 2, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }, {
+        /* Mode 3 (GDM WeightQuantModel) */
+        0, 0, 0, 3, 2, 1, 5, 5,
+        0, 0, 4, 3, 2, 1, 5, 5,
+        0, 4, 4, 3, 2, 1, 5, 5,
+        3, 3, 3, 3, 2, 5, 5, 5,
+        2, 2, 2, 2, 5, 5, 5, 5,
+        1, 1, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }
+};
+
 static const uint8_t dequant_shift[64] = {
   14, 14, 14, 14, 14, 14, 14, 14,
   13, 13, 13, 13, 13, 13, 13, 13,
@@ -615,8 +662,8 @@ static inline int dequant32(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
 {
     int round = 1 << (shift - 1);
     int pos = -1;
-    /* natural scan order: the AEC path uses its own 32-bit IDCT
-     * (cavs_idct8_add_int32) which expects unpermuted coefficients */
+    /* natural scan order: the AEC and Broadcasting VLC paths use
+     * ff_cavs_idct8_add_int32(), which expects unpermuted coefficients */
     const uint8_t *scantab = h->pic_structure ? ff_zigzag_direct
                                               : ff_cavs_field_scan;
 
@@ -629,7 +676,18 @@ static inline int dequant32(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
                    h->cur.poc, h->mbx, h->mby);
             return AVERROR_INVALIDDATA;
         }
-        dst[scantab[pos]] = (level_buf[coeff_num] * mul + round) >> shift;
+        if (h->weight_quant_flag) {
+            /* Guangdian weighting quantisation:
+             * ((((level * wqm) >> 3) * mul) >> 4) + round) >> shift.
+             * The product can exceed INT_MAX for extreme coefficients;
+             * truncate to int32 for the defined wraparound of the
+             * reference decoder instead of signed overflow */
+            int32_t prod = (int32_t)((int64_t)(((int)level_buf[coeff_num] *
+                                                 h->wqm_8x8[scantab[pos]]) >> 3) *
+                                     mul) >> 4;
+            dst[scantab[pos]] = (prod + round) >> shift;
+        } else
+            dst[scantab[pos]] = (level_buf[coeff_num] * mul + round) >> shift;
     }
     return 0;
 }
@@ -757,6 +815,18 @@ static int decode_residual_block(AVSContext *h, GetBitContext *gb,
         }
         level_buf[i] = level;
         run_buf[i]   = run;
+    }
+    if (h->profile != AV_PROFILE_CAVS_JIZHUN) {
+        /* the GDM reference (AVS1-P16) keeps dequantized coefficients in
+         * 32-bit ints, unlike rm52k (AVS1-P2) which truncates to int16 */
+        int *block32 = h->block32;
+
+        if ((ret = dequant32(h, level_buf, run_buf, block32, dequant_mul[qp],
+                             dequant_shift[qp], i)) >= 0)
+            cavs_idct8_add_int32(dst, block32, stride);
+        /* dequant32() can write before it fails, so always clear the block */
+        memset(block32, 0, 64 * sizeof(*block32));
+        return ret;
     }
     ret = dequant(h, level_buf, run_buf, block, dequant_mul[qp],
                   dequant_shift[qp], i);
@@ -1254,7 +1324,14 @@ static int decode_residual(AVSContext *h, const struct dec_2dvlc *r,
 
 static inline void get_chroma_qp(AVSContext *h, int *qp_cb, int *qp_cr)
 {
-    *qp_cb = *qp_cr = ff_cavs_chroma_qp[h->qp];
+    int cb = h->qp, cr = h->qp;
+
+    if (h->weight_quant_flag && !h->chroma_quant_param_disable) {
+        cb = av_clip_uintp2(h->qp + h->chroma_quant_param_delta_cb, 6);
+        cr = av_clip_uintp2(h->qp + h->chroma_quant_param_delta_cr, 6);
+    }
+    *qp_cb = ff_cavs_chroma_qp[cb];
+    *qp_cr = ff_cavs_chroma_qp[cr];
 }
 
 /** decode the residual of one chroma 8x8 block
@@ -2241,10 +2318,35 @@ static int decode_pic(AVSContext *h)
 
     /* AWQ parameters and aec_enable end the header (tables 21, 22) */
     h->aec_enable = 0;
+    h->weight_quant_flag = 0;
     if (h->profile == AV_PROFILE_CAVS_BROADCASTING) {
-        if (get_bits1(&h->gb)) { //weighting_quant_flag
-            avpriv_request_sample(h->avctx, "Adaptive weighted quantization");
-            return AVERROR_PATCHWELCOME;
+        h->weight_quant_flag = get_bits1(&h->gb);
+        if (h->weight_quant_flag) {
+            int wq_param[6];
+            int wqp_index, wq_model;
+            const uint8_t *m2p;
+
+            skip_bits1(&h->gb); //reserved bit (mb_adapt_weighting_quant_disable in GDM)
+            h->chroma_quant_param_disable = get_bits1(&h->gb);
+            if (!h->chroma_quant_param_disable) {
+                h->chroma_quant_param_delta_cb = get_se_golomb(&h->gb);
+                h->chroma_quant_param_delta_cr = get_se_golomb(&h->gb);
+            }
+            wqp_index = get_bits(&h->gb, 2);
+            wq_model  = get_bits(&h->gb, 2);   // weighting_quant_model, 0..3
+            m2p = wq_model_2_param[wq_model];
+
+            for (int i = 0; i < 6; i++) {
+                int delta = (wqp_index == 1 || wqp_index == 2) ?
+                            get_se_golomb(&h->gb) : 0;
+                wq_param[i] = default_wq_param[wqp_index][i] + delta;
+                av_log(h->avctx, AV_LOG_DEBUG, "wqp[%d]=%d\n", i, wq_param[i]);
+            }
+            for (int i = 0; i < 64; i++)
+                h->wqm_8x8[i] = wq_param[m2p[i]];
+        } else {
+            h->chroma_quant_param_disable = 1;
+            memset(h->wqm_8x8, 128, sizeof(h->wqm_8x8));
         }
         h->aec_enable = get_bits1(&h->gb);
     }

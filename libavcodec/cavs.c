@@ -105,6 +105,16 @@ static inline int get_bs(cavs_vector *mvP, cavs_vector *mvQ, int b)
     beta  =  beta_tab[av_clip_uintp2(qp_avg + h->beta_offset,  6)];  \
     tc    =    tc_tab[av_clip_uintp2(qp_avg + h->alpha_offset, 6)];
 
+/** chroma quantizer for the loop filter; the Guangdian profile may
+ * signal per-plane offsets with the weighting quantisation parameters */
+static inline int filter_chroma_qp(AVSContext *h, int qp, int plane)
+{
+    if (h->weight_quant_flag && !h->chroma_quant_param_disable)
+        qp = av_clip_uintp2(qp + (plane ? h->chroma_quant_param_delta_cr
+                                        : h->chroma_quant_param_delta_cb), 6);
+    return ff_cavs_chroma_qp[qp];
+}
+
 /**
  * in-loop deblocking filter for a single macroblock
  *
@@ -163,7 +173,8 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
                 qp_avg = (h->qp + h->left_qp + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_lv(h->cy, h->l_stride, alpha, beta, tc, bs[0], bs[1]);
-                qp_avg = (ff_cavs_chroma_qp[h->qp] + ff_cavs_chroma_qp[h->left_qp] + 1) >> 1;
+                qp_avg = (filter_chroma_qp(h, h->qp, 0) +
+                          filter_chroma_qp(h, h->left_qp, 0) + 1) >> 1;
                 SET_PARAMS;
                 if (h->chroma_format == 2) {
                     /* 4:2:2: the left chroma edge is 16 samples high, the
@@ -174,8 +185,8 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
                 } else {
                     h->cdsp.cavs_filter_cv(h->cu, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
                 }
-                qp_avg = (ff_cavs_chroma_qp[h->qp] +
-                          ff_cavs_chroma_qp[h->left_qp] + 1) >> 1;
+                qp_avg = (filter_chroma_qp(h, h->qp, 1) +
+                          filter_chroma_qp(h, h->left_qp, 1) + 1) >> 1;
                 SET_PARAMS;
                 if (h->chroma_format == 2) {
                     h->cdsp.cavs_filter_cv(h->cv, h->c_stride, alpha, beta, tc, bs[0], bs[0]);
@@ -191,10 +202,10 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
             if (h->chroma_format == 2) {
                 /* 4:2:2: the internal horizontal luma edge coincides with
                  * the edge between the two chroma 8x8 blocks */
-                qp_avg = ff_cavs_chroma_qp[h->qp];
+                qp_avg = filter_chroma_qp(h, h->qp, 0);
                 SET_PARAMS;
                 h->cdsp.cavs_filter_ch(h->cu + 8 * h->c_stride, h->c_stride, alpha, beta, tc, bs[6], bs[7]);
-                qp_avg = ff_cavs_chroma_qp[h->qp];
+                qp_avg = filter_chroma_qp(h, h->qp, 1);
                 SET_PARAMS;
                 h->cdsp.cavs_filter_ch(h->cv + 8 * h->c_stride, h->c_stride, alpha, beta, tc, bs[6], bs[7]);
             }
@@ -203,9 +214,13 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
                 qp_avg = (h->qp + h->top_qp[h->mbx] + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_lh(h->cy, h->l_stride, alpha, beta, tc, bs[4], bs[5]);
-                qp_avg = (ff_cavs_chroma_qp[h->qp] + ff_cavs_chroma_qp[h->top_qp[h->mbx]] + 1) >> 1;
+                qp_avg = (filter_chroma_qp(h, h->qp, 0) +
+                          filter_chroma_qp(h, h->top_qp[h->mbx], 0) + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_ch(h->cu, h->c_stride, alpha, beta, tc, bs[4], bs[5]);
+                qp_avg = (filter_chroma_qp(h, h->qp, 1) +
+                          filter_chroma_qp(h, h->top_qp[h->mbx], 1) + 1) >> 1;
+                SET_PARAMS;
                 h->cdsp.cavs_filter_ch(h->cv, h->c_stride, alpha, beta, tc, bs[4], bs[5]);
             }
         }

@@ -805,7 +805,7 @@ static int aec_mb_skip_run(AVSContext *h)
 
     while (!ff_cavs_aec_decode_decision(&h->aec,
                                         AEC_MB_SKIP_RUN + FFMIN(v, 3))) {
-        if (++v > h->mb_width * h->mb_height) {
+        if (++v > h->mb_width * h->mb_height_pic) {
             av_log(h->avctx, AV_LOG_ERROR, "mb_skip_run out of range\n");
             return AVERROR_INVALIDDATA;
         }
@@ -2111,6 +2111,55 @@ static int set_ref_list(AVSContext *h)
     return 0;
 }
 
+/* The GDM reference decoder allocates its picture buffers with
+ * img->height = vertical_size + auto_crop_bottom rows and, after
+ * deblocking, conceals the never-coded bottom macroblock rows
+ * (exit_picture, ERROR_CONTROL): the first frame of the sequence
+ * replicates its last coded row (SpaticalErrConceal), later frames copy
+ * the same rows from the forward reference (CopyFromPreviousFrame),
+ * i.e. DPB[0] before the DPB update below.  Motion compensation clamps
+ * at img->height-1 and reads those rows, so they must be reproduced
+ * here for bit-exact output. */
+static void cavs_conceal_bottom_rows(AVSContext *h)
+{
+    const int coded_h  = h->mb_height_pic * 16;
+    /* chroma plane height: half the luma height for 4:2:0, full for 4:2:2 */
+    const int vsub     = h->chroma_format == 2 ? 1 : 2;
+    const int coded_ch = coded_h / vsub;
+    const int buf_h    = h->mb_height * 16;
+    AVFrame *cur = h->cur.f;
+    int y;
+
+    if (!h->pic_structure || buf_h <= coded_h || !cur->buf[0])
+        return;
+
+    if (!h->DPB[0].f->buf[0]) {
+        /* first frame: replicate the last coded row */
+        for (y = coded_h; y < buf_h; y++)
+            memcpy(cur->data[0] + y * cur->linesize[0],
+                   cur->data[0] + (coded_h - 1) * cur->linesize[0], h->width);
+        for (y = coded_ch; y < buf_h / vsub; y++) {
+            memcpy(cur->data[1] + y * cur->linesize[1],
+                   cur->data[1] + (coded_ch - 1) * cur->linesize[1], h->width / 2);
+            memcpy(cur->data[2] + y * cur->linesize[2],
+                   cur->data[2] + (coded_ch - 1) * cur->linesize[2], h->width / 2);
+        }
+    } else {
+        /* copy from the forward reference (zero motion, full pel) */
+        AVFrame *ref = h->DPB[0].f;
+
+        for (y = coded_h; y < buf_h; y++)
+            memcpy(cur->data[0] + y * cur->linesize[0],
+                   ref->data[0] + y * ref->linesize[0], h->width);
+        for (y = coded_ch; y < buf_h / vsub; y++) {
+            memcpy(cur->data[1] + y * cur->linesize[1],
+                   ref->data[1] + y * ref->linesize[1], h->width / 2);
+            memcpy(cur->data[2] + y * cur->linesize[2],
+                   ref->data[2] + y * ref->linesize[2], h->width / 2);
+        }
+    }
+}
+
 static int decode_pic(AVSContext *h)
 {
     int ret;
@@ -2201,6 +2250,11 @@ static int decode_pic(AVSContext *h)
     /* a field coded picture uses inverse block scan method 2 (9.5.3 c)) */
     h->scantable = h->pic_structure ? h->permutated_scantable
                                     : h->permutated_scantable_field;
+    /* a frame picture of an interlaced sequence codes ceil(height/16)
+     * rows; the even rounding of mb_height is for field pictures only
+     * (clause 7.2.2) */
+    h->mb_height_pic = h->pic_structure ? (h->height + 15) >> 4
+                                        : h->mb_height;
     if (!h->pic_structure && h->stc == PIC_PB_START_CODE)
         skip_bits1(&h->gb);     //advanced_pred_mode_disable
     h->top_field_first = get_bits1(&h->gb);
@@ -2336,6 +2390,8 @@ static int decode_pic(AVSContext *h)
         if (ret < 0)
             break;
     } while (ff_cavs_next_mb(h));
+    if (ret >= 0)
+        cavs_conceal_bottom_rows(h);
     if (ret >= 0 && h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
         av_frame_unref(h->DPB[1].f);
         FFSWAP(AVSFrame, h->cur, h->DPB[1]);

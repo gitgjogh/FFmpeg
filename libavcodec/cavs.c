@@ -984,7 +984,7 @@ int ff_cavs_next_mb(AVSContext *h)
         }
         h->mbx = 0;
         h->mby++;
-        if (h->mby == h->mb_height) { // Frame end
+        if (h->mby == h->mb_height_pic) { // Frame end
             return 0;
         }
         /* re-calculate sample pointers */

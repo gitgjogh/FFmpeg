@@ -199,6 +199,7 @@ typedef struct AVSContext {
     int aspect_ratio;
     int chroma_format; ///< 1: 4:2:0, 2: 4:2:2 (level 4.2/6.2 streams)
     int mb_width, mb_height;
+    int mb_height_pic;  ///< coded macroblock rows of the current picture
     int width, height;
     int stream_revision; ///<0 for samples from 2006, 1 for rm52j encoder
     int progressive;

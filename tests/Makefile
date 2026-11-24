@@ -187,6 +187,7 @@ include $(SRC_PATH)/tests/fate/apv.mak
 include $(SRC_PATH)/tests/fate/atrac.mak
 include $(SRC_PATH)/tests/fate/audio.mak
 include $(SRC_PATH)/tests/fate/av1.mak
+include $(SRC_PATH)/tests/fate/avs.mak
 include $(SRC_PATH)/tests/fate/bmp.mak
 include $(SRC_PATH)/tests/fate/build.mak
 include $(SRC_PATH)/tests/fate/caf.mak

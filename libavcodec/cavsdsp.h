@@ -38,6 +38,8 @@ typedef struct CAVSDSPContext {
     int idct_perm;
 } CAVSDSPContext;
 
+void ff_cavs_idct8_add_int32(uint8_t *dst, int *block, ptrdiff_t stride);
+
 void ff_cavsdsp_init(CAVSDSPContext* c);
 void ff_cavsdsp_init_x86(CAVSDSPContext* c);
 

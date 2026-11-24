@@ -70,6 +70,55 @@ static void idct8_add_ref(uint8_t *dst, const int16_t coeffs[64])
     }
 }
 
+/**
+ * Reference for the 32-bit input variant: same butterflies, but the
+ * (possibly out-of-int16-range) input is not truncated first; sums
+ * are computed with 64-bit intermediates.
+ */
+static void idct8_add_int32_ref(uint8_t *dst, const int coeffs[64])
+{
+    int tmp[8][8];
+
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            int64_t sum = 4;
+            for (int k = 0; k < 8; k++)
+                sum += (int64_t)coeffs[8 * i + k] * t8[j][k];
+            tmp[i][j] = av_clip_int16(sum) >> 3;
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            int sum = 64;
+            for (int k = 0; k < 8; k++)
+                sum += t8[i][k] * tmp[k][j];
+            dst[j] = av_clip_uint8(dst[j] + (av_clip_int16(sum) >> 7));
+        }
+        dst += STRIDE;
+    }
+}
+
+static int check_block32(const int coeffs[64], AVLFG *lfg, int n)
+{
+    DECLARE_ALIGNED(16, int, block)[64];
+    DECLARE_ALIGNED(16, uint8_t, ref)[8 * STRIDE];
+    DECLARE_ALIGNED(16, uint8_t, out)[8 * STRIDE];
+
+    /* the 32-bit variant expects unpermuted coefficients */
+    for (int i = 0; i < 64; i++)
+        block[i] = coeffs[i];
+    for (int i = 0; i < 8 * STRIDE; i++)
+        ref[i] = out[i] = av_lfg_get(lfg);
+
+    idct8_add_int32_ref(ref, coeffs);
+    ff_cavs_idct8_add_int32(out, block, STRIDE);
+    if (memcmp(ref, out, sizeof(ref))) {
+        fprintf(stderr, "cavs_idct8_add_int32: mismatch in block %d\n", n);
+        return 1;
+    }
+    return 0;
+}
+
 static int check_block(CAVSDSPContext *c, const uint8_t *perm,
                        const int16_t coeffs[64], AVLFG *lfg, int n)
 {
@@ -116,6 +165,7 @@ int main(void)
     /* magnitudes from the whole int16_t range down to single digits */
     for (int iter = 0; iter < 100000; iter++) {
         int count = 1 + av_lfg_get(&lfg) % 64;
+        int coeffs32[64] = { 0 };
 
         memset(coeffs, 0, sizeof(coeffs));
         for (int k = 0; k < count; k++) {
@@ -123,6 +173,26 @@ int main(void)
             coeffs[r & 63] = (int16_t)av_lfg_get(&lfg) >> (r >> 6 & 15);
         }
         ret |= check_block(&c, perm, coeffs, &lfg, n++);
+        /* the int32 variant must agree with the 16-bit C version for
+         * int16-range inputs */
+        for (int i = 0; i < 64; i++)
+            coeffs32[i] = coeffs[i];
+        ret |= check_block32(coeffs32, &lfg, n++);
+    }
+
+    /* and out-of-int16-range coefficients, which only it accepts; bound
+     * them to the range the decoder can produce (dequant32 output is
+     * well within 1<<24, which keeps the butterfly sums in int range) */
+    for (int iter = 0; iter < 10000; iter++) {
+        int coeffs32[64] = { 0 };
+        int count = 1 + av_lfg_get(&lfg) % 64;
+
+        for (int k = 0; k < count; k++) {
+            unsigned r = av_lfg_get(&lfg);
+            coeffs32[r & 63] = av_clip((int)av_lfg_get(&lfg) >> (r >> 6 & 15),
+                                       -(1 << 24), (1 << 24) - 1);
+        }
+        ret |= check_block32(coeffs32, &lfg, n++);
     }
 
     return ret;

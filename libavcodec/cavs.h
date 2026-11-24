@@ -172,6 +172,7 @@ struct dec_2dvlc {
 typedef struct AVSFrame {
     AVFrame *f;
     int poc;
+    int already_output; ///< already returned to the caller
 } AVSFrame;
 
 typedef struct AVSContext {
@@ -197,7 +198,9 @@ typedef struct AVSContext {
     int progressive_seq;
     int profile, level;
     int aspect_ratio;
+    int chroma_format; ///< 1: 4:2:0, 2: 4:2:2 (level 4.2/6.2 streams)
     int mb_width, mb_height;
+    int mb_height_pic;  ///< coded macroblock rows of the current picture
     int width, height;
     int stream_revision; ///<0 for samples from 2006, 1 for rm52j encoder
     int progressive;
@@ -221,6 +224,29 @@ typedef struct AVSContext {
     int loop_filter_disable;
     int alpha_offset, beta_offset;
     int ref_flag;
+
+    /** \defgroup Guangdian weighting quantisation
+     * @{
+     */
+    int weight_quant_flag;
+    int chroma_quant_param_disable;
+    int chroma_quant_param_delta_cb;
+    int chroma_quant_param_delta_cr;
+    uint8_t wqm_8x8[64];
+    /**@}*/
+
+    /** \defgroup slice weighting
+     * @{
+     */
+    uint32_t slice_weight_pred_flag : 1;
+    uint32_t mb_weight_pred_flag    : 1;
+    uint8_t luma_scale[4];
+    int8_t luma_shift[4];
+    uint8_t chroma_scale[4];
+    int8_t chroma_shift[4];
+    /**@}*/
+    int mb_weight_pred;  ///< apply weighted prediction to current MB
+    uint8_t *wp_y, *wp_u, *wp_v; ///< temp buffers for weighted bi-prediction
     int mbx, mby, mbidx; ///< macroblock coordinates
     int flags;         ///< availability flags of neighbouring macroblocks
     int stc;           ///< last start code
@@ -259,7 +285,10 @@ typedef struct AVSContext {
     int qp_fixed;
     int pic_qp_fixed;
     int cbp;
+    int cbp422;        ///< coded block pattern of the second chroma 8x8
+                       ///< blocks (4:2:2): bit0 = U, bit1 = V
     DECLARE_ALIGNED(32, int16_t, block)[64];
+    DECLARE_ALIGNED(32, int, block32)[64]; ///< AEC path: 32-bit coefficients
     uint8_t permutated_scantable[64];
     /** inverse block scan method 2 of clause 9.5.3 c), for field pictures */
     uint8_t permutated_scantable_field[64];
@@ -269,7 +298,7 @@ typedef struct AVSContext {
     /** intra prediction is done with un-deblocked samples
      they are saved here before deblocking the MB  */
     uint8_t *top_border_y, *top_border_u, *top_border_v;
-    uint8_t left_border_y[26], left_border_u[10], left_border_v[10];
+    uint8_t left_border_y[26], left_border_u[17], left_border_v[17];
     uint8_t intern_border_y[26];
     uint8_t topleft_border_y, topleft_border_u, topleft_border_v;
 
@@ -306,6 +335,7 @@ typedef struct AVSContext {
 } AVSContext;
 
 extern const uint8_t     ff_cavs_chroma_qp[64];
+extern const uint8_t     ff_cavs_field_scan[64];
 extern const uint8_t     ff_cavs_partition_flags[30];
 
 /** mark block as using intra prediction */
@@ -350,6 +380,8 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_load_intra_pred_luma(AVSContext *h, uint8_t *top, uint8_t **left,
                                   int block);
 void ff_cavs_load_intra_pred_chroma(AVSContext *h);
+void ff_cavs_intra_pred_chroma_422(AVSContext *h, uint8_t *dc,
+                                   uint8_t *left_border, int pred_mode);
 void ff_cavs_modify_mb_i(AVSContext *h, int *pred_mode_uv);
 void ff_cavs_inter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,

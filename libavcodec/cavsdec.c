@@ -61,6 +61,53 @@ static const uint8_t cbp_tab[64][2] = {
 
 static const uint8_t scan3x3[4] = { 4, 5, 7, 8 };
 
+static const uint8_t default_wq_param[4][6] = {
+    {128,  98, 106, 116, 116, 128},
+    {135, 143, 143, 160, 160, 213},
+    {128,  98, 106, 116, 116, 128},
+    {128, 128, 128, 128, 128, 128},
+};
+static const uint8_t wq_model_2_param[4][64] = {
+    {
+        0, 0, 0, 4, 4, 4, 5, 5,
+        0, 0, 3, 3, 3, 3, 5, 5,
+        0, 3, 2, 2, 1, 1, 5, 5,
+        4, 3, 2, 2, 1, 5, 5, 5,
+        4, 3, 1, 1, 5, 5, 5, 5,
+        4, 3, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }, {
+        0, 0, 0, 4, 4, 4, 5, 5,
+        0, 0, 4, 4, 4, 4, 5, 5,
+        0, 3, 2, 2, 2, 1, 5, 5,
+        3, 3, 2, 2, 1, 5, 5, 5,
+        3, 3, 2, 1, 5, 5, 5, 5,
+        3, 3, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }, {
+        0, 0, 0, 4, 4, 3, 5, 5,
+        0, 0, 4, 4, 3, 2, 5, 5,
+        0, 4, 4, 3, 2, 1, 5, 5,
+        4, 4, 3, 2, 1, 5, 5, 5,
+        4, 3, 2, 1, 5, 5, 5, 5,
+        3, 2, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }, {
+        /* Mode 3 (GDM WeightQuantModel) */
+        0, 0, 0, 3, 2, 1, 5, 5,
+        0, 0, 4, 3, 2, 1, 5, 5,
+        0, 4, 4, 3, 2, 1, 5, 5,
+        3, 3, 3, 3, 2, 5, 5, 5,
+        2, 2, 2, 2, 5, 5, 5, 5,
+        1, 1, 1, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 5, 5, 5, 5, 5, 5,
+    }
+};
+
 static const uint8_t dequant_shift[64] = {
   14, 14, 14, 14, 14, 14, 14, 14,
   13, 13, 13, 13, 13, 13, 13, 13,
@@ -558,9 +605,15 @@ static inline void mv_pred_sym(AVSContext *h, cavs_vector *src,
     dst->dist    = h->dist[dst->ref];
     dst->ref_idx = 0;               /* derived, not read (clause 9.4.5) */
     factor = dst->dist * h->scale_den[src->ref];
-    /* backward mv is the scaled and negated forward mv */
-    dst->x = -((src->x * factor + 256) >> 9);
-    dst->y = -((src->y * factor + 256) >> 9);
+    /* backward mv is the scaled and negated forward mv; the product can
+     * exceed INT_MAX with a wrapped picture distance, truncate to int32
+     * for the defined wraparound of the reference decoder */
+    {
+        int32_t px = (int32_t)((int64_t)src->x * factor);
+        int32_t py = (int32_t)((int64_t)src->y * factor);
+        dst->x = -(int)(((int64_t)px + 256) >> 9);
+        dst->y = -(int)(((int64_t)py + 256) >> 9);
+    }
     set_mvs(dst, size);
 }
 
@@ -604,6 +657,47 @@ static inline int dequant(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
     }
     return 0;
 }
+
+/**
+ * AEC path variant of dequant(): the GDM reference keeps the dequantized
+ * coefficients in 32-bit ints (rm52k truncates them to int16), so large
+ * levels at low QPs must not be truncated here
+ */
+static inline int dequant32(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
+                            int *dst, int mul, int shift, int coeff_num)
+{
+    int round = 1 << (shift - 1);
+    int pos = -1;
+    /* natural scan order: the AEC and Broadcasting VLC paths use
+     * ff_cavs_idct8_add_int32(), which expects unpermuted coefficients */
+    const uint8_t *scantab = h->pic_structure ? ff_zigzag_direct
+                                              : ff_cavs_field_scan;
+
+    /* inverse scan and dequantization */
+    while (--coeff_num >= 0) {
+        pos += run_buf[coeff_num];
+        if (pos > 63) {
+            av_log(h->avctx, AV_LOG_ERROR,
+                   "position out of block bounds at pic %d MB(%d,%d)\n",
+                   h->cur.poc, h->mbx, h->mby);
+            return AVERROR_INVALIDDATA;
+        }
+        if (h->weight_quant_flag) {
+            /* Guangdian weighting quantisation:
+             * ((((level * wqm) >> 3) * mul) >> 4) + round) >> shift.
+             * The product can exceed INT_MAX for extreme coefficients;
+             * truncate to int32 for the defined wraparound of the
+             * reference decoder instead of signed overflow */
+            int32_t prod = (int32_t)((int64_t)(((int)level_buf[coeff_num] *
+                                                 h->wqm_8x8[scantab[pos]]) >> 3) *
+                                     mul) >> 4;
+            dst[scantab[pos]] = (prod + round) >> shift;
+        } else
+            dst[scantab[pos]] = (level_buf[coeff_num] * mul + round) >> shift;
+    }
+    return 0;
+}
+
 
 /**
  * decode coefficients from one 8x8 block, dequantize, inverse transform
@@ -653,6 +747,18 @@ static int decode_residual_block(AVSContext *h, GetBitContext *gb,
         level_buf[i] = level;
         run_buf[i]   = run;
     }
+    if (h->profile != AV_PROFILE_CAVS_JIZHUN) {
+        /* the GDM reference (AVS1-P16) keeps dequantized coefficients in
+         * 32-bit ints, unlike rm52k (AVS1-P2) which truncates to int16 */
+        int *block32 = h->block32;
+
+        if ((ret = dequant32(h, level_buf, run_buf, block32, dequant_mul[qp],
+                             dequant_shift[qp], i)) >= 0)
+            ff_cavs_idct8_add_int32(dst, block32, stride);
+        /* dequant32() can write before it fails, so always clear the block */
+        memset(block32, 0, 64 * sizeof(*block32));
+        return ret;
+    }
     ret = dequant(h, level_buf, run_buf, block, dequant_mul[qp],
                   dequant_shift[qp], i);
     if (ret >= 0)
@@ -684,6 +790,7 @@ static int decode_residual_block(AVSContext *h, GetBitContext *gb,
 #define AEC_COEFF_FRAME_CHROMA      124
 #define AEC_COEFF_FIELD_LUMA        190
 #define AEC_COEFF_FIELD_CHROMA      256
+#define AEC_MB_WEIGHT_PRED          322
 
 /* a conforming block's quantized coefficients span -2^(n+3)..2^(n+3)-1
  * with n the sample precision, 8 for both profiles (clause 9.6.2) */
@@ -704,7 +811,7 @@ static int aec_mb_skip_run(AVSContext *h)
 
     while (!ff_cavs_aec_decode_decision(&h->aec,
                                         AEC_MB_SKIP_RUN + FFMIN(v, 3))) {
-        if (++v > h->mb_width * h->mb_height) {
+        if (++v > h->mb_width * h->mb_height_pic) {
             av_log(h->avctx, AV_LOG_ERROR, "mb_skip_run out of range\n");
             return AVERROR_INVALIDDATA;
         }
@@ -962,7 +1069,6 @@ static int decode_residual_block_aec(AVSContext *h, int chroma, int qp,
 {
     int16_t level_buf[65];
     uint8_t run_buf[65];
-    int16_t *block = h->block;
     int lmax = 0, pos = 0, i, base, ret;
 
     if (h->pic_structure)
@@ -1045,11 +1151,13 @@ static int decode_residual_block_aec(AVSContext *h, int chroma, int qp,
         pos  = FFMIN(pos + run_val + 1, 63);
     }
 
-    ret = dequant(h, level_buf, run_buf, block, dequant_mul[qp],
-                  dequant_shift[qp], i);
+    int *block32 = h->block32;
+
+    ret = dequant32(h, level_buf, run_buf, block32, dequant_mul[qp],
+                    dequant_shift[qp], i);
     if (ret >= 0)
-        h->cdsp.cavs_idct8_add(dst, block, stride);
-    h->bdsp.clear_block(block);
+        ff_cavs_idct8_add_int32(dst, block32, stride);
+    memset(block32, 0, 64 * sizeof(*block32));
     return ret;
 }
 
@@ -1120,7 +1228,7 @@ static int decode_mb_qp_delta(AVSContext *h)
 {
     int delta = 0;
 
-    if (h->cbp && !h->qp_fixed) {
+    if ((h->cbp | h->cbp422) && !h->qp_fixed) {
         if (h->aec_enable) {
             int ret = aec_mb_qp_delta(h, &delta);
             if (ret < 0)
@@ -1145,20 +1253,61 @@ static int decode_residual(AVSContext *h, const struct dec_2dvlc *r,
                                  stride);
 }
 
+static inline void get_chroma_qp(AVSContext *h, int *qp_cb, int *qp_cr)
+{
+    int cb = h->qp, cr = h->qp;
+
+    if (h->weight_quant_flag && !h->chroma_quant_param_disable) {
+        cb = av_clip_uintp2(h->qp + h->chroma_quant_param_delta_cb, 6);
+        cr = av_clip_uintp2(h->qp + h->chroma_quant_param_delta_cr, 6);
+    }
+    *qp_cb = ff_cavs_chroma_qp[cb];
+    *qp_cr = ff_cavs_chroma_qp[cr];
+}
+
+/** decode the residual of one chroma 8x8 block
+ * @param plane  0: Cb, 1: Cr
+ * @param second 1: the lower 8x8 block of a 4:2:2 macroblock */
+static inline int decode_residual_chroma_block(AVSContext *h, int plane,
+                                               int second)
+{
+    int qp_cb, qp_cr;
+    uint8_t *dst = plane ? h->cv : h->cu;
+
+    if (second)
+        dst += 8 * h->c_stride;
+    get_chroma_qp(h, &qp_cb, &qp_cr);
+    return decode_residual(h, chroma_dec, 0, 1,
+                           plane ? qp_cr : qp_cb, dst, h->c_stride);
+}
+
+/* chroma residuals are stored in the bitstream in the order Cb1, Cr1 for
+ * 4:2:0 and Cb1, Cr1, Cb2, Cr2 (CBP then CBP422) for 4:2:2 */
 static inline int decode_residual_chroma(AVSContext *h)
 {
-    const int qp = ff_cavs_chroma_qp[h->qp];
     int ret;
 
     if (h->cbp & (1 << 4)) {
-        ret = decode_residual(h, chroma_dec, 0, 1, qp, h->cu, h->c_stride);
+        ret = decode_residual_chroma_block(h, 0, 0);
         if (ret < 0)
             return ret;
     }
     if (h->cbp & (1 << 5)) {
-        ret = decode_residual(h, chroma_dec, 0, 1, qp, h->cv, h->c_stride);
+        ret = decode_residual_chroma_block(h, 1, 0);
         if (ret < 0)
             return ret;
+    }
+    if (h->chroma_format == 2) {
+        if (h->cbp422 & 1) {
+            ret = decode_residual_chroma_block(h, 0, 1);
+            if (ret < 0)
+                return ret;
+        }
+        if (h->cbp422 & 2) {
+            ret = decode_residual_chroma_block(h, 1, 1);
+            if (ret < 0)
+                return ret;
+        }
     }
     return 0;
 }
@@ -1177,6 +1326,16 @@ static inline int decode_residual_inter(AVSContext *h)
             return AVERROR_INVALIDDATA;
         }
         h->cbp = cbp_tab[cbp][1];
+    }
+    /* 4:2:2 streams carry a second coded block pattern for the lower
+     * chroma 8x8 blocks right after CBP (GDM CBP422); the reference
+     * decoder reads it with the UVLC reader even in AEC streams */
+    if (h->chroma_format == 2) {
+        h->cbp422 = get_ue_golomb(&h->gb);
+        if (h->cbp422 > 3U) {
+            av_log(h->avctx, AV_LOG_ERROR, "illegal cbp422 %d\n", h->cbp422);
+            return AVERROR_INVALIDDATA;
+        }
     }
     ret = decode_mb_qp_delta(h);
     if (ret < 0)
@@ -1212,6 +1371,7 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
 {
     GetBitContext *gb = &h->gb;
     unsigned pred_mode_uv;
+    unsigned pred_mode_uv_2 = 0; ///< intra_chroma_pred_mode_422 (4:2:2)
     int block;
     uint8_t top[18];
     uint8_t *left = NULL;
@@ -1249,6 +1409,14 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
             return AVERROR_INVALIDDATA;
         }
     }
+    if (h->chroma_format == 2) {
+        /* 4:2:2: prediction mode of the lower chroma 8x8 blocks */
+        pred_mode_uv_2 = get_ue_golomb_31(gb);
+        if (pred_mode_uv_2 > 6) {
+            av_log(h->avctx, AV_LOG_ERROR, "illegal intra chroma pred mode 422\n");
+            return AVERROR_INVALIDDATA;
+        }
+    }
     ff_cavs_modify_mb_i(h, &pred_mode_uv);
 
     /* get coded block pattern */
@@ -1264,6 +1432,16 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
             return AVERROR_INVALIDDATA;
         }
         h->cbp = cbp_tab[cbp_code][0];
+    }
+    /* 4:2:2 streams carry a second coded block pattern for the lower
+     * chroma 8x8 blocks right after CBP (GDM CBP422); the reference
+     * decoder reads it with the UVLC reader even in AEC streams */
+    if (h->chroma_format == 2) {
+        h->cbp422 = get_ue_golomb(gb);
+        if (h->cbp422 > 3U) {
+            av_log(h->avctx, AV_LOG_ERROR, "illegal cbp422 %d\n", h->cbp422);
+            return AVERROR_INVALIDDATA;
+        }
     }
     ret = decode_mb_qp_delta(h);
     if (ret < 0)
@@ -1289,9 +1467,39 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
     h->intra_pred_c[pred_mode_uv](h->cv, &h->top_border_v[h->mbx * 10],
                                   h->left_border_v, h->c_stride);
 
-    ret = decode_residual_chroma(h);
-    if (ret < 0)
-        return ret;
+    if (h->chroma_format == 2) {
+        /* the chroma residuals are stored Cb1, Cr1, Cb2, Cr2 while the
+         * prediction of the second 8x8 blocks needs the reconstructed
+         * first blocks: interleave prediction and residual decoding */
+        if (h->cbp & (1 << 4)) {
+            ret = decode_residual_chroma_block(h, 0, 0);
+            if (ret < 0)
+                return ret;
+        }
+        if (h->cbp & (1 << 5)) {
+            ret = decode_residual_chroma_block(h, 1, 0);
+            if (ret < 0)
+                return ret;
+        }
+        ff_cavs_intra_pred_chroma_422(h, h->cu + 8 * h->c_stride,
+                                      h->left_border_u, pred_mode_uv_2);
+        if (h->cbp422 & 1) {
+            ret = decode_residual_chroma_block(h, 0, 1);
+            if (ret < 0)
+                return ret;
+        }
+        ff_cavs_intra_pred_chroma_422(h, h->cv + 8 * h->c_stride,
+                                      h->left_border_v, pred_mode_uv_2);
+        if (h->cbp422 & 2) {
+            ret = decode_residual_chroma_block(h, 1, 1);
+            if (ret < 0)
+                return ret;
+        }
+    } else {
+        ret = decode_residual_chroma(h);
+        if (ret < 0)
+            return ret;
+    }
     ff_cavs_filter(h, I_8X8);
     set_mv_intra(h);
     return 0;
@@ -1433,6 +1641,21 @@ static int decode_mb_p(AVSContext *h, enum cavs_mb mb_type)
         av_log(h->avctx, AV_LOG_ERROR, "Invalid mb_type %d in P frame\n",
                mb_type);
         return AVERROR_INVALIDDATA;
+    }
+    if (h->slice_weight_pred_flag) {
+        /* skip MBs are never weighted when per-MB weights are signalled */
+        if (h->mb_weight_pred_flag) {
+            if (mb_type != P_SKIP)
+                h->mb_weight_pred = h->aec_enable
+                    ? ff_cavs_aec_decode_decision(&h->aec, AEC_MB_WEIGHT_PRED)
+                    : get_bits1(&h->gb);
+            else
+                h->mb_weight_pred = 0;
+        } else {
+            h->mb_weight_pred = 1;
+        }
+    } else {
+        h->mb_weight_pred = 0;
     }
     ff_cavs_inter(h, mb_type);
     set_intra_mode_default(h);
@@ -1614,6 +1837,21 @@ static int decode_mb_b(AVSContext *h, enum cavs_mb mb_type)
                 MV(MV_BWD_X1, MV_BWD_C2, MV_PRED_TOPRIGHT, BLK_8X16, ref[1][1]);
         }
     }
+    if (h->slice_weight_pred_flag) {
+        /* skip MBs are never weighted when per-MB weights are signalled */
+        if (h->mb_weight_pred_flag) {
+            if (mb_type != B_SKIP)
+                h->mb_weight_pred = h->aec_enable
+                    ? ff_cavs_aec_decode_decision(&h->aec, AEC_MB_WEIGHT_PRED)
+                    : get_bits1(&h->gb);
+            else
+                h->mb_weight_pred = 0;
+        } else {
+            h->mb_weight_pred = 1;
+        }
+    } else {
+        h->mb_weight_pred = 0;
+    }
     ff_cavs_inter(h, mb_type);
     set_intra_mode_default(h);
     if (mb_type != B_SKIP) {
@@ -1711,11 +1949,65 @@ static inline int decode_slice_header(AVSContext *h, GetBitContext *gb)
     }
     /* inter frame or second slice can have weighting params */
     if ((h->cur.f->pict_type != AV_PICTURE_TYPE_I) ||
-        (!h->pic_structure && h->mbidx >= h->mb_width * h->mb_height / 2))
-        if (get_bits1(gb)) { //slice_weighting_flag
-            avpriv_request_sample(h->avctx, "Weighted prediction");
-            return AVERROR_PATCHWELCOME;
+        (!h->pic_structure && h->mbidx >= h->mb_width * h->mb_height / 2)) {
+        h->slice_weight_pred_flag = get_bits1(gb);
+        if (h->slice_weight_pred_flag) {
+            /* a second I field codes one weight set, a field picture
+             * codes four (one per reference field), a frame two */
+            int nref = h->cur.f->pict_type == AV_PICTURE_TYPE_I ? 1
+                     : !h->pic_structure ? 4 : 2;
+            for (int i = 0; i < nref; i++) {
+                h->luma_scale[i]   = get_bits(gb, 8);
+                h->luma_shift[i]   = get_sbits(gb, 8);
+                skip_bits1(gb);
+                h->chroma_scale[i] = get_bits(gb, 8);
+                h->chroma_shift[i] = get_sbits(gb, 8);
+                skip_bits1(gb);
+            }
+            h->mb_weight_pred_flag = get_bits1(gb);
         }
+    }
+    return 0;
+}
+
+/**
+ * Skip the stuffing following a picture header: optional alignment
+ * zero bits, 0x80 stuffing bytes and the leading zero bytes of the
+ * next start code (some encoders pad pictures with kilobytes of
+ * zeros).  The reader is rewound when no start code follows.
+ * @return 1 if stuffing was skipped, 0 otherwise
+ */
+static inline int skip_stuffing_bits(AVSContext *h)
+{
+    GetBitContext gb0 = h->gb;
+    GetBitContext *gb = &h->gb;
+    const uint8_t *start;
+    const uint8_t *ptr;
+    const uint8_t *end;
+    int align;
+    int stuffing_zeros;
+
+    /* seems like not all the streams follow next_start_code() strictly */
+    align = (-get_bits_count(gb)) & 7;
+    if (align == 0 && show_bits(gb, 8) == 0x80)
+        skip_bits_long(gb, 8);
+
+    /* skip leading zero bytes before 0x000001 stc */
+    ptr = start = align_get_bits(gb);
+    end = gb->buffer + (gb->size_in_bits >> 3);
+    while (ptr < end && *ptr == 0)
+        ptr++;
+
+    if ((ptr >= end) || (*ptr == 1 && ptr - start >= 2)) {
+        stuffing_zeros = (ptr >= end ? end - start : ptr - start - 2);
+        if (stuffing_zeros > 0)
+            av_log(h->avctx, AV_LOG_DEBUG, "Skip 0x%x stuffing zeros @0x%x",
+                   stuffing_zeros, (int)(start - gb->buffer));
+        skip_bits_long(gb, stuffing_zeros * 8);
+        return 1;
+    }
+
+    h->gb = gb0;
     return 0;
 }
 
@@ -1735,15 +2027,17 @@ static inline int check_for_slice(AVSContext *h)
         int stc;
 
         align = (-get_bits_count(gb)) & 7;
-        /* check for stuffing byte */
-        if (!align && (show_bits(gb, 8) == 0x80))
-            align = 8;
-        if ((show_bits_long(gb, 24 + align) & 0xFFFFFF) != 0x000001)
-            return 0;
-        if (!is_start_code_offset(h, (get_bits_count(gb) + align) >> 3))
-            return 0;
+        /* skip stuffing: alignment zero bits, then any 0x80 stuffing
+         * bytes (each is the '1' stuffing bit plus seven zero bits) */
         peek = *gb;
-        skip_bits_long(&peek, 24 + align);
+        skip_bits(&peek, align);
+        while (show_bits(&peek, 8) == 0x80)
+            skip_bits(&peek, 8);
+        if ((show_bits_long(&peek, 24) & 0xFFFFFF) != 0x000001)
+            return 0;
+        if (!is_start_code_offset(h, get_bits_count(&peek) >> 3))
+            return 0;
+        skip_bits_long(&peek, 24);
         stc = get_bits(&peek, 8);
         if (stc > (SLICE_MAX_START_CODE & 0xFF)) {
             /* video_sequence() places extension_and_user_data(1) between
@@ -1798,7 +2092,6 @@ static int set_ref_list(AVSContext *h)
     const int poc  = h->cur.poc;
     const int poc0 = h->DPB[0].poc;
     const int poc1 = h->DPB[1].poc;
-    int nref;
 
 #define SET_REF(idx, frame, par, distance)      \
     do {                                        \
@@ -1816,12 +2109,10 @@ static int set_ref_list(AVSContext *h)
             SET_REF(i, h->DPB[1].f, 0, poc - poc1);
         /* figure 18: a B frame codes no reference index */
         h->ref_base[0] = b;
-        nref = 1;
     } else if (h->cur.f->pict_type == AV_PICTURE_TYPE_I) {
         /* figure 14: the second field references its own first field */
         for (int i = 0; i < FF_ARRAY_ELEMS(h->ref); i++)
             SET_REF(i, h->cur.f, f1, 1);
-        nref = 1;
     } else if (!b) {
         if (!h->field) {
             /* figure 16: the four fields of the two previous frames */
@@ -1836,7 +2127,6 @@ static int set_ref_list(AVSContext *h)
             SET_REF(2, h->DPB[0].f, f1, poc - poc0 + 1);
             SET_REF(3, h->DPB[1].f, f2, poc - poc1);
         }
-        nref = 4;
     } else {
         /* figures 19 and 20: two backward and two forward fields */
         SET_REF(0, h->DPB[0].f, f1, poc0     - poc - h->field);
@@ -1844,26 +2134,62 @@ static int set_ref_list(AVSContext *h)
         SET_REF(2, h->DPB[1].f, f2, poc + h->field - poc1 - 1);
         SET_REF(3, h->DPB[1].f, f1, poc + h->field - poc1);
         h->ref_base[0] = 2;
-        nref = 2;
     }
 #undef SET_REF
 
     for (int i = 0; i < FF_ARRAY_ELEMS(h->ref); i++)
         h->scale_den[i] = h->dist[i] ? 512 / h->dist[i] : 0;
 
-    for (int i = 0; b && i < nref; i++) {
-        int fw     = h->ref_base[0] + i;
-        int bw     = h->pic_structure ? h->ref_base[1]
-                                      : h->ref_base[1] + 1 - i;
-        int factor = h->dist[bw] * h->scale_den[fw];
+    return 0;
+}
 
-        if (factor > 32768) {
-            av_log(h->avctx, AV_LOG_ERROR,
-                   "symmetric scaling factor %d too large\n", factor);
-            return AVERROR_INVALIDDATA;
+/* The GDM reference decoder allocates its picture buffers with
+ * img->height = vertical_size + auto_crop_bottom rows and, after
+ * deblocking, conceals the never-coded bottom macroblock rows
+ * (exit_picture, ERROR_CONTROL): the first frame of the sequence
+ * replicates its last coded row (SpaticalErrConceal), later frames copy
+ * the same rows from the forward reference (CopyFromPreviousFrame),
+ * i.e. DPB[0] before the DPB update below.  Motion compensation clamps
+ * at img->height-1 and reads those rows, so they must be reproduced
+ * here for bit-exact output. */
+static void cavs_conceal_bottom_rows(AVSContext *h)
+{
+    const int coded_h  = h->mb_height_pic * 16;
+    /* chroma plane height: half the luma height for 4:2:0, full for 4:2:2 */
+    const int vsub     = h->chroma_format == 2 ? 1 : 2;
+    const int coded_ch = coded_h / vsub;
+    const int buf_h    = h->mb_height * 16;
+    AVFrame *cur = h->cur.f;
+    int y;
+
+    if (!h->pic_structure || buf_h <= coded_h || !cur->buf[0])
+        return;
+
+    if (!h->DPB[0].f->buf[0]) {
+        /* first frame: replicate the last coded row */
+        for (y = coded_h; y < buf_h; y++)
+            memcpy(cur->data[0] + y * cur->linesize[0],
+                   cur->data[0] + (coded_h - 1) * cur->linesize[0], h->width);
+        for (y = coded_ch; y < buf_h / vsub; y++) {
+            memcpy(cur->data[1] + y * cur->linesize[1],
+                   cur->data[1] + (coded_ch - 1) * cur->linesize[1], h->width / 2);
+            memcpy(cur->data[2] + y * cur->linesize[2],
+                   cur->data[2] + (coded_ch - 1) * cur->linesize[2], h->width / 2);
+        }
+    } else {
+        /* copy from the forward reference (zero motion, full pel) */
+        AVFrame *ref = h->DPB[0].f;
+
+        for (y = coded_h; y < buf_h; y++)
+            memcpy(cur->data[0] + y * cur->linesize[0],
+                   ref->data[0] + y * ref->linesize[0], h->width);
+        for (y = coded_ch; y < buf_h / vsub; y++) {
+            memcpy(cur->data[1] + y * cur->linesize[1],
+                   ref->data[1] + y * ref->linesize[1], h->width / 2);
+            memcpy(cur->data[2] + y * cur->linesize[2],
+                   ref->data[2] + y * ref->linesize[2], h->width / 2);
         }
     }
-    return 0;
 }
 
 static int decode_pic(AVSContext *h)
@@ -1879,6 +2205,7 @@ static int decode_pic(AVSContext *h)
     }
 
     av_frame_unref(h->cur.f);
+    h->cur.already_output = 0;
 
     skip_bits(&h->gb, 16);//bbv_delay
     if (h->profile == AV_PROFILE_CAVS_BROADCASTING)
@@ -1925,6 +2252,17 @@ static int decode_pic(AVSContext *h)
         if (!h->edge_emu_buffer)
             return AVERROR(ENOMEM);
     }
+    if (!h->wp_y) {
+        int alloc_size = FFALIGN(FFABS(h->cur.f->linesize[0]) + 32, 32);
+        /* 16 luma rows + 2 x 16 chroma rows (4:2:2) for weighted
+         * bi-prediction; rows may be up to twice the frame stride for
+         * field pictures */
+        h->wp_y = av_mallocz(alloc_size * 2 * 48);
+        if (!h->wp_y)
+            return AVERROR(ENOMEM);
+        h->wp_u = h->wp_y + alloc_size * 2 * 16;
+        h->wp_v = h->wp_u + alloc_size * 2 * 16;
+    }
 
     /* picture_distance; DistanceIndex is twice it (clause 9.4.6.1) */
     h->cur.poc = get_bits(&h->gb, 8) * 2;
@@ -1945,6 +2283,11 @@ static int decode_pic(AVSContext *h)
     /* a field coded picture uses inverse block scan method 2 (9.5.3 c)) */
     h->scantable = h->pic_structure ? h->permutated_scantable
                                     : h->permutated_scantable_field;
+    /* a frame picture of an interlaced sequence codes ceil(height/16)
+     * rows; the even rounding of mb_height is for field pictures only
+     * (clause 7.2.2) */
+    h->mb_height_pic = h->pic_structure ? (h->height + 15) >> 4
+                                        : h->mb_height;
     if (!h->pic_structure && h->stc == PIC_PB_START_CODE)
         skip_bits1(&h->gb);     //advanced_pred_mode_disable
     h->top_field_first = get_bits1(&h->gb);
@@ -1987,13 +2330,40 @@ static int decode_pic(AVSContext *h)
 
     /* AWQ parameters and aec_enable end the header (tables 21, 22) */
     h->aec_enable = 0;
+    h->weight_quant_flag = 0;
     if (h->profile == AV_PROFILE_CAVS_BROADCASTING) {
-        if (get_bits1(&h->gb)) { //weighting_quant_flag
-            avpriv_request_sample(h->avctx, "Adaptive weighted quantization");
-            return AVERROR_PATCHWELCOME;
+        h->weight_quant_flag = get_bits1(&h->gb);
+        if (h->weight_quant_flag) {
+            int wq_param[6];
+            int wqp_index, wq_model;
+            const uint8_t *m2p;
+
+            skip_bits1(&h->gb); //reserved bit (mb_adapt_weighting_quant_disable in GDM)
+            h->chroma_quant_param_disable = get_bits1(&h->gb);
+            if (!h->chroma_quant_param_disable) {
+                h->chroma_quant_param_delta_cb = get_se_golomb(&h->gb);
+                h->chroma_quant_param_delta_cr = get_se_golomb(&h->gb);
+            }
+            wqp_index = get_bits(&h->gb, 2);
+            wq_model  = get_bits(&h->gb, 2);   // weighting_quant_model, 0..3
+            m2p = wq_model_2_param[wq_model];
+
+            for (int i = 0; i < 6; i++) {
+                int delta = (wqp_index == 1 || wqp_index == 2) ?
+                            get_se_golomb(&h->gb) : 0;
+                wq_param[i] = default_wq_param[wqp_index][i] + delta;
+                av_log(h->avctx, AV_LOG_DEBUG, "wqp[%d]=%d\n", i, wq_param[i]);
+            }
+            for (int i = 0; i < 64; i++)
+                h->wqm_8x8[i] = wq_param[m2p[i]];
+        } else {
+            h->chroma_quant_param_disable = 1;
+            memset(h->wqm_8x8, 128, sizeof(h->wqm_8x8));
         }
         h->aec_enable = get_bits1(&h->gb);
     }
+
+    skip_stuffing_bits(h);
 
     /* in a frame picture the field derivations reduce to the frame ones
      * (9.9.1 b) 3)) */
@@ -2019,7 +2389,11 @@ static int decode_pic(AVSContext *h)
     h->aec.gb = NULL;   /* started by the first slice header */
     h->pic_data_end = 0;
     do {
-        ret = check_for_slice(h);
+        /* do not look for a new slice while a skip run is pending: the
+         * run consumes no bits, so the bits ahead may already be the
+         * next slice's start code although MBs of the current slice
+         * are still to be skipped */
+        ret = skip_count > 0 ? 0 : check_for_slice(h);
         if (ret < 0)
             break;
         if (ret)
@@ -2055,6 +2429,8 @@ static int decode_pic(AVSContext *h)
         if (ret < 0)
             break;
     } while (ff_cavs_next_mb(h));
+    if (ret >= 0)
+        cavs_conceal_bottom_rows(h);
     if (ret >= 0 && h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
         av_frame_unref(h->DPB[1].f);
         FFSWAP(AVSFrame, h->cur, h->DPB[1]);
@@ -2102,23 +2478,27 @@ static int decode_seq_header(AVSContext *h)
     }
     chroma_format    = get_bits(&h->gb, 2);
     sample_precision = get_bits(&h->gb, 3);
-    /* the Broadcasting macroblock layer is written for 8 bit 4:2:0 */
+    /* the Broadcasting macroblock layer is written for 8 bit */
     if (profile == AV_PROFILE_CAVS_BROADCASTING) {
         if (sample_precision != 1) {
             av_log(h->avctx, AV_LOG_ERROR,
                    "sample_precision %d is not 8 bit\n", sample_precision);
             return AVERROR_INVALIDDATA;
         }
-        if (chroma_format == 2) {
-            avpriv_request_sample(h->avctx, "4:2:2 chroma");
-            return AVERROR_PATCHWELCOME;
-        }
-        if (chroma_format != 1) {
-            av_log(h->avctx, AV_LOG_ERROR,
-                   "chroma_format %d is reserved\n", chroma_format);
-            return AVERROR_INVALIDDATA;
-        }
     }
+    /* legacy encoder clips (e.g. cavs.mpg) signal the reserved value 0
+     * while carrying 4:2:0 content; FFmpeg historically decoded those
+     * by ignoring the field.  In the AVS1-P16 spec 0 means 4:0:0
+     * (monochrome), which is not implemented - reject it for the
+     * Broadcasting profile rather than misdecoding it as 4:2:0. */
+    if (chroma_format == 3 ||
+        !chroma_format && profile == AV_PROFILE_CAVS_BROADCASTING) {
+        avpriv_report_missing_feature(h->avctx, "chroma_format %d",
+                                      chroma_format);
+        return AVERROR_PATCHWELCOME;
+    }
+    if (chroma_format != 2)
+        chroma_format = 1;
     aspect_ratio = get_bits(&h->gb, 4);
     frame_rate_code = get_bits(&h->gb, 4);
     if (frame_rate_code == 0 || frame_rate_code > 13) {
@@ -2141,6 +2521,13 @@ static int decode_seq_header(AVSContext *h)
         avpriv_report_missing_feature(h->avctx, "Macroblock grid changing");
         return AVERROR_PATCHWELCOME;
     }
+    /* the DPB references share the current chroma geometry; a mid-stream
+     * chroma_format change would let motion compensation read the old
+     * references with the new plane heights */
+    if (h->top_qp && chroma_format != h->chroma_format) {
+        avpriv_report_missing_feature(h->avctx, "chroma_format changing in CAVS");
+        return AVERROR_PATCHWELCOME;
+    }
 
     /* horizontal_size and vertical_size are only the displayed part */
     ret = ff_set_dimensions(h->avctx, mb_width * 16, mb_height * 16);
@@ -2158,6 +2545,7 @@ static int decode_seq_header(AVSContext *h)
     h->mb_width        = mb_width;
     h->mb_height       = mb_height;
     h->low_delay       = low_delay;
+    h->chroma_format   = chroma_format;
     h->avctx->profile  = profile;
     h->progressive_seq = progressive_seq;
     h->avctx->framerate = ff_mpeg12_frame_rate_tab[frame_rate_code];
@@ -2329,9 +2717,10 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
     int frame_start = 0;
 
     if (buf_size == 0) {
-        if (!h->low_delay && h->DPB[0].f->data[0]) {
+        if (h->DPB[0].f->data[0] && !h->DPB[0].already_output) {
             *got_frame = 1;
             av_frame_move_ref(rframe, h->DPB[0].f);
+            h->DPB[0].already_output = 1;
         }
         return 0;
     }
@@ -2355,6 +2744,8 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
             ret = decode_seq_header(h);
             if (ret < 0)
                 return ret;
+            avctx->pix_fmt = h->chroma_format == 2 ? AV_PIX_FMT_YUV422P
+                                                   : AV_PIX_FMT_YUV420P;
             break;
         case PIC_I_START_CODE:
             if (!h->got_keyframe) {
@@ -2385,9 +2776,19 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                 return ret;
             *got_frame = 1;
             if (h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
-                if (h->DPB[!h->low_delay].f->data[0]) {
-                    if ((ret = av_frame_ref(rframe, h->DPB[!h->low_delay].f)) < 0)
+                /* the display queue is one deep: output the backlog frame
+                 * first, then the current one when it is due (immediately
+                 * for low_delay, one picture late otherwise) */
+                AVSFrame *out = NULL;
+                if (h->DPB[1].f->data[0] && !h->DPB[1].already_output)
+                    out = &h->DPB[1];
+                else if (h->low_delay && h->DPB[0].f->data[0] &&
+                         !h->DPB[0].already_output)
+                    out = &h->DPB[0];
+                if (out) {
+                    if ((ret = av_frame_ref(rframe, out->f)) < 0)
                         return ret;
+                    out->already_output = 1;
                 } else {
                     *got_frame = 0;
                 }

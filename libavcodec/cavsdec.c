@@ -692,81 +692,6 @@ static inline int dequant32(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
     return 0;
 }
 
-/**
- * AEC path variant of cavs_idct8_add() taking 32-bit coefficients, matching
- * inv_transform_B8() of the GDM reference: same butterflies as
- * cavs_idct8_add_c(), same clipping of the row and column results to int16,
- * but the (possibly out-of-int16-range) input is not truncated first
- */
-static void cavs_idct8_add_int32(uint8_t *dst, int *block, ptrdiff_t stride)
-{
-    int i;
-    int (*src)[8] = (int(*)[8])block;
-
-    for (i = 0; i < 8; i++) {
-        const int a0 = 3 * src[i][1] - 2 * src[i][7];
-        const int a1 = 3 * src[i][3] + 2 * src[i][5];
-        const int a2 = 2 * src[i][3] - 3 * src[i][5];
-        const int a3 = 2 * src[i][1] + 3 * src[i][7];
-
-        const int b4 = 2 * (a0 + a1 + a3) + a1;
-        const int b5 = 2 * (a0 - a1 + a2) + a0;
-        const int b6 = 2 * (a3 - a2 - a1) + a3;
-        const int b7 = 2 * (a0 - a2 - a3) - a2;
-
-        const int a7 = 4 * src[i][2] - 10 * src[i][6];
-        const int a6 = 4 * src[i][6] + 10 * src[i][2];
-        const int a5 = 8 * (src[i][0] - src[i][4]) + 4;
-        const int a4 = 8 * (src[i][0] + src[i][4]) + 4;
-
-        const int b0 = a4 + a6;
-        const int b1 = a5 + a7;
-        const int b2 = a5 - a7;
-        const int b3 = a4 - a6;
-
-        /* the GDM reference clips the row results to int16 before shifting */
-        src[i][0] = av_clip_int16(b0 + b4) >> 3;
-        src[i][1] = av_clip_int16(b1 + b5) >> 3;
-        src[i][2] = av_clip_int16(b2 + b6) >> 3;
-        src[i][3] = av_clip_int16(b3 + b7) >> 3;
-        src[i][4] = av_clip_int16(b3 - b7) >> 3;
-        src[i][5] = av_clip_int16(b2 - b6) >> 3;
-        src[i][6] = av_clip_int16(b1 - b5) >> 3;
-        src[i][7] = av_clip_int16(b0 - b4) >> 3;
-    }
-    for (i = 0; i < 8; i++) {
-        const int a0 = 3 * src[1][i] - 2 * src[7][i];
-        const int a1 = 3 * src[3][i] + 2 * src[5][i];
-        const int a2 = 2 * src[3][i] - 3 * src[5][i];
-        const int a3 = 2 * src[1][i] + 3 * src[7][i];
-
-        const int b4 = 2 * (a0 + a1 + a3) + a1;
-        const int b5 = 2 * (a0 - a1 + a2) + a0;
-        const int b6 = 2 * (a3 - a2 - a1) + a3;
-        const int b7 = 2 * (a0 - a2 - a3) - a2;
-
-        const int a7 = 4 * src[2][i] - 10 * src[6][i];
-        const int a6 = 4 * src[6][i] + 10 * src[2][i];
-        const int a5 = 8 * (src[0][i] - src[4][i]);
-        const int a4 = 8 * (src[0][i] + src[4][i]);
-
-        const int b0 = a4 + a6;
-        const int b1 = a5 + a7;
-        const int b2 = a5 - a7;
-        const int b3 = a4 - a6;
-
-        /* GDM clips the column results (including the +64 rounding) to
-         * int16 before shifting */
-        dst[i + 0*stride] = av_clip_uint8( dst[i + 0*stride] + (av_clip_int16(b0 + b4 + 64) >> 7));
-        dst[i + 1*stride] = av_clip_uint8( dst[i + 1*stride] + (av_clip_int16(b1 + b5 + 64) >> 7));
-        dst[i + 2*stride] = av_clip_uint8( dst[i + 2*stride] + (av_clip_int16(b2 + b6 + 64) >> 7));
-        dst[i + 3*stride] = av_clip_uint8( dst[i + 3*stride] + (av_clip_int16(b3 + b7 + 64) >> 7));
-        dst[i + 4*stride] = av_clip_uint8( dst[i + 4*stride] + (av_clip_int16(b3 - b7 + 64) >> 7));
-        dst[i + 5*stride] = av_clip_uint8( dst[i + 5*stride] + (av_clip_int16(b2 - b6 + 64) >> 7));
-        dst[i + 6*stride] = av_clip_uint8( dst[i + 6*stride] + (av_clip_int16(b1 - b5 + 64) >> 7));
-        dst[i + 7*stride] = av_clip_uint8( dst[i + 7*stride] + (av_clip_int16(b0 - b4 + 64) >> 7));
-    }
-}
 
 /**
  * decode coefficients from one 8x8 block, dequantize, inverse transform
@@ -823,7 +748,7 @@ static int decode_residual_block(AVSContext *h, GetBitContext *gb,
 
         if ((ret = dequant32(h, level_buf, run_buf, block32, dequant_mul[qp],
                              dequant_shift[qp], i)) >= 0)
-            cavs_idct8_add_int32(dst, block32, stride);
+            ff_cavs_idct8_add_int32(dst, block32, stride);
         /* dequant32() can write before it fails, so always clear the block */
         memset(block32, 0, 64 * sizeof(*block32));
         return ret;
@@ -1225,7 +1150,7 @@ static int decode_residual_block_aec(AVSContext *h, int chroma, int qp,
     ret = dequant32(h, level_buf, run_buf, block32, dequant_mul[qp],
                     dequant_shift[qp], i);
     if (ret >= 0)
-        cavs_idct8_add_int32(dst, block32, stride);
+        ff_cavs_idct8_add_int32(dst, block32, stride);
     memset(block32, 0, 64 * sizeof(*block32));
     return ret;
 }

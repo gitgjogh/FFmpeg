@@ -63,7 +63,7 @@ static const cavs_vector un_mv = { 0, 0, 1, NOT_AVAIL, 0 };
  * Inverse block scan method 2 (clause 9.5.3 c), figure 23), for field
  * coded pictures, as the inverse ff_permute_scantable() expects.
  */
-static const uint8_t cavs_scan_field[64] = {
+const uint8_t ff_cavs_field_scan[64] = {
      0,  8, 16,  1, 24, 32,  9, 17, 40, 48, 25,  2, 10, 56, 33, 18,
      3, 41, 49, 26, 11, 19,  4, 57, 34, 12, 42, 27, 20, 50, 35, 28,
      5, 13, 58, 43, 36, 21,  6, 29, 51, 44, 14, 22, 37, 59, 52, 30,
@@ -1073,7 +1073,7 @@ av_cold int ff_cavs_init(AVCodecContext *avctx)
     ff_cavsdsp_init(&h->cdsp);
     ff_init_scantable_permutation(permutation, h->cdsp.idct_perm);
     ff_permute_scantable(h->permutated_scantable, ff_zigzag_direct, permutation);
-    ff_permute_scantable(h->permutated_scantable_field, cavs_scan_field,
+    ff_permute_scantable(h->permutated_scantable_field, ff_cavs_field_scan,
                          permutation);
     h->scantable = h->permutated_scantable;
 

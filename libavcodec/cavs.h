@@ -276,6 +276,7 @@ typedef struct AVSContext {
     int cbp422;        ///< coded block pattern of the second chroma 8x8
                        ///< blocks (4:2:2): bit0 = U, bit1 = V
     DECLARE_ALIGNED(32, int16_t, block)[64];
+    DECLARE_ALIGNED(32, int, block32)[64]; ///< AEC path: 32-bit coefficients
     uint8_t permutated_scantable[64];
     /** inverse block scan method 2 of clause 9.5.3 c), for field pictures */
     uint8_t permutated_scantable_field[64];
@@ -322,6 +323,7 @@ typedef struct AVSContext {
 } AVSContext;
 
 extern const uint8_t     ff_cavs_chroma_qp[64];
+extern const uint8_t     ff_cavs_field_scan[64];
 extern const uint8_t     ff_cavs_partition_flags[30];
 
 /** mark block as using intra prediction */

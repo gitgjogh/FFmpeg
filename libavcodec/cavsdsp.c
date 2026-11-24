@@ -240,22 +240,26 @@ static void cavs_idct8_add_c(uint8_t *dst, int16_t *block, ptrdiff_t stride)
 
         const int a7 = 4 * src[2][i] - 10 * src[6][i];
         const int a6 = 4 * src[6][i] + 10 * src[2][i];
-        const int a5 = 8 * (src[0][i] - src[4][i]) + 64;
-        const int a4 = 8 * (src[0][i] + src[4][i]) + 64;
+        const int a5 = 8 * (src[0][i] - src[4][i]);
+        const int a4 = 8 * (src[0][i] + src[4][i]);
 
         const int b0 = a4 + a6;
         const int b1 = a5 + a7;
         const int b2 = a5 - a7;
         const int b3 = a4 - a6;
 
-        dst[i + 0*stride] = av_clip_uint8( dst[i + 0*stride] + ((b0 + b4) >> 7));
-        dst[i + 1*stride] = av_clip_uint8( dst[i + 1*stride] + ((b1 + b5) >> 7));
-        dst[i + 2*stride] = av_clip_uint8( dst[i + 2*stride] + ((b2 + b6) >> 7));
-        dst[i + 3*stride] = av_clip_uint8( dst[i + 3*stride] + ((b3 + b7) >> 7));
-        dst[i + 4*stride] = av_clip_uint8( dst[i + 4*stride] + ((b3 - b7) >> 7));
-        dst[i + 5*stride] = av_clip_uint8( dst[i + 5*stride] + ((b2 - b6) >> 7));
-        dst[i + 6*stride] = av_clip_uint8( dst[i + 6*stride] + ((b1 - b5) >> 7));
-        dst[i + 7*stride] = av_clip_uint8( dst[i + 7*stride] + ((b0 - b4) >> 7));
+        /* rm52k clips the column results (including the +64 rounding) to
+         * int16 before shifting; an explicit rounding constant is needed
+         * here because the src[0][0] += 8 trick would be destroyed by the
+         * int16 clipping in the row pass for saturating coefficients */
+        dst[i + 0*stride] = av_clip_uint8( dst[i + 0*stride] + (av_clip_int16(b0 + b4 + 64) >> 7));
+        dst[i + 1*stride] = av_clip_uint8( dst[i + 1*stride] + (av_clip_int16(b1 + b5 + 64) >> 7));
+        dst[i + 2*stride] = av_clip_uint8( dst[i + 2*stride] + (av_clip_int16(b2 + b6 + 64) >> 7));
+        dst[i + 3*stride] = av_clip_uint8( dst[i + 3*stride] + (av_clip_int16(b3 + b7 + 64) >> 7));
+        dst[i + 4*stride] = av_clip_uint8( dst[i + 4*stride] + (av_clip_int16(b3 - b7 + 64) >> 7));
+        dst[i + 5*stride] = av_clip_uint8( dst[i + 5*stride] + (av_clip_int16(b2 - b6 + 64) >> 7));
+        dst[i + 6*stride] = av_clip_uint8( dst[i + 6*stride] + (av_clip_int16(b1 - b5 + 64) >> 7));
+        dst[i + 7*stride] = av_clip_uint8( dst[i + 7*stride] + (av_clip_int16(b0 - b4 + 64) >> 7));
     }
 }
 

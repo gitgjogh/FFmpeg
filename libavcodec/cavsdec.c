@@ -2387,7 +2387,11 @@ static int decode_pic(AVSContext *h)
     h->aec.gb = NULL;   /* started by the first slice header */
     h->pic_data_end = 0;
     do {
-        ret = check_for_slice(h);
+        /* do not look for a new slice while a skip run is pending: the
+         * run consumes no bits, so the bits ahead may already be the
+         * next slice's start code although MBs of the current slice
+         * are still to be skipped */
+        ret = skip_count > 0 ? 0 : check_for_slice(h);
         if (ret < 0)
             break;
         if (ret)

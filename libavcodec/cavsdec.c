@@ -1120,7 +1120,7 @@ static int decode_mb_qp_delta(AVSContext *h)
 {
     int delta = 0;
 
-    if (h->cbp && !h->qp_fixed) {
+    if ((h->cbp | h->cbp422) && !h->qp_fixed) {
         if (h->aec_enable) {
             int ret = aec_mb_qp_delta(h, &delta);
             if (ret < 0)
@@ -1145,20 +1145,54 @@ static int decode_residual(AVSContext *h, const struct dec_2dvlc *r,
                                  stride);
 }
 
+static inline void get_chroma_qp(AVSContext *h, int *qp_cb, int *qp_cr)
+{
+    *qp_cb = *qp_cr = ff_cavs_chroma_qp[h->qp];
+}
+
+/** decode the residual of one chroma 8x8 block
+ * @param plane  0: Cb, 1: Cr
+ * @param second 1: the lower 8x8 block of a 4:2:2 macroblock */
+static inline int decode_residual_chroma_block(AVSContext *h, int plane,
+                                               int second)
+{
+    int qp_cb, qp_cr;
+    uint8_t *dst = plane ? h->cv : h->cu;
+
+    if (second)
+        dst += 8 * h->c_stride;
+    get_chroma_qp(h, &qp_cb, &qp_cr);
+    return decode_residual(h, chroma_dec, 0, 1,
+                           plane ? qp_cr : qp_cb, dst, h->c_stride);
+}
+
+/* chroma residuals are stored in the bitstream in the order Cb1, Cr1 for
+ * 4:2:0 and Cb1, Cr1, Cb2, Cr2 (CBP then CBP422) for 4:2:2 */
 static inline int decode_residual_chroma(AVSContext *h)
 {
-    const int qp = ff_cavs_chroma_qp[h->qp];
     int ret;
 
     if (h->cbp & (1 << 4)) {
-        ret = decode_residual(h, chroma_dec, 0, 1, qp, h->cu, h->c_stride);
+        ret = decode_residual_chroma_block(h, 0, 0);
         if (ret < 0)
             return ret;
     }
     if (h->cbp & (1 << 5)) {
-        ret = decode_residual(h, chroma_dec, 0, 1, qp, h->cv, h->c_stride);
+        ret = decode_residual_chroma_block(h, 1, 0);
         if (ret < 0)
             return ret;
+    }
+    if (h->chroma_format == 2) {
+        if (h->cbp422 & 1) {
+            ret = decode_residual_chroma_block(h, 0, 1);
+            if (ret < 0)
+                return ret;
+        }
+        if (h->cbp422 & 2) {
+            ret = decode_residual_chroma_block(h, 1, 1);
+            if (ret < 0)
+                return ret;
+        }
     }
     return 0;
 }
@@ -1177,6 +1211,16 @@ static inline int decode_residual_inter(AVSContext *h)
             return AVERROR_INVALIDDATA;
         }
         h->cbp = cbp_tab[cbp][1];
+    }
+    /* 4:2:2 streams carry a second coded block pattern for the lower
+     * chroma 8x8 blocks right after CBP (GDM CBP422); the reference
+     * decoder reads it with the UVLC reader even in AEC streams */
+    if (h->chroma_format == 2) {
+        h->cbp422 = get_ue_golomb(&h->gb);
+        if (h->cbp422 > 3U) {
+            av_log(h->avctx, AV_LOG_ERROR, "illegal cbp422 %d\n", h->cbp422);
+            return AVERROR_INVALIDDATA;
+        }
     }
     ret = decode_mb_qp_delta(h);
     if (ret < 0)
@@ -1212,6 +1256,7 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
 {
     GetBitContext *gb = &h->gb;
     unsigned pred_mode_uv;
+    unsigned pred_mode_uv_2 = 0; ///< intra_chroma_pred_mode_422 (4:2:2)
     int block;
     uint8_t top[18];
     uint8_t *left = NULL;
@@ -1249,6 +1294,14 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
             return AVERROR_INVALIDDATA;
         }
     }
+    if (h->chroma_format == 2) {
+        /* 4:2:2: prediction mode of the lower chroma 8x8 blocks */
+        pred_mode_uv_2 = get_ue_golomb_31(gb);
+        if (pred_mode_uv_2 > 6) {
+            av_log(h->avctx, AV_LOG_ERROR, "illegal intra chroma pred mode 422\n");
+            return AVERROR_INVALIDDATA;
+        }
+    }
     ff_cavs_modify_mb_i(h, &pred_mode_uv);
 
     /* get coded block pattern */
@@ -1264,6 +1317,16 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
             return AVERROR_INVALIDDATA;
         }
         h->cbp = cbp_tab[cbp_code][0];
+    }
+    /* 4:2:2 streams carry a second coded block pattern for the lower
+     * chroma 8x8 blocks right after CBP (GDM CBP422); the reference
+     * decoder reads it with the UVLC reader even in AEC streams */
+    if (h->chroma_format == 2) {
+        h->cbp422 = get_ue_golomb(gb);
+        if (h->cbp422 > 3U) {
+            av_log(h->avctx, AV_LOG_ERROR, "illegal cbp422 %d\n", h->cbp422);
+            return AVERROR_INVALIDDATA;
+        }
     }
     ret = decode_mb_qp_delta(h);
     if (ret < 0)
@@ -1289,9 +1352,39 @@ static int decode_mb_i(AVSContext *h, int cbp_code)
     h->intra_pred_c[pred_mode_uv](h->cv, &h->top_border_v[h->mbx * 10],
                                   h->left_border_v, h->c_stride);
 
-    ret = decode_residual_chroma(h);
-    if (ret < 0)
-        return ret;
+    if (h->chroma_format == 2) {
+        /* the chroma residuals are stored Cb1, Cr1, Cb2, Cr2 while the
+         * prediction of the second 8x8 blocks needs the reconstructed
+         * first blocks: interleave prediction and residual decoding */
+        if (h->cbp & (1 << 4)) {
+            ret = decode_residual_chroma_block(h, 0, 0);
+            if (ret < 0)
+                return ret;
+        }
+        if (h->cbp & (1 << 5)) {
+            ret = decode_residual_chroma_block(h, 1, 0);
+            if (ret < 0)
+                return ret;
+        }
+        ff_cavs_intra_pred_chroma_422(h, h->cu + 8 * h->c_stride,
+                                      h->left_border_u, pred_mode_uv_2);
+        if (h->cbp422 & 1) {
+            ret = decode_residual_chroma_block(h, 0, 1);
+            if (ret < 0)
+                return ret;
+        }
+        ff_cavs_intra_pred_chroma_422(h, h->cv + 8 * h->c_stride,
+                                      h->left_border_v, pred_mode_uv_2);
+        if (h->cbp422 & 2) {
+            ret = decode_residual_chroma_block(h, 1, 1);
+            if (ret < 0)
+                return ret;
+        }
+    } else {
+        ret = decode_residual_chroma(h);
+        if (ret < 0)
+            return ret;
+    }
     ff_cavs_filter(h, I_8X8);
     set_mv_intra(h);
     return 0;
@@ -2102,23 +2195,27 @@ static int decode_seq_header(AVSContext *h)
     }
     chroma_format    = get_bits(&h->gb, 2);
     sample_precision = get_bits(&h->gb, 3);
-    /* the Broadcasting macroblock layer is written for 8 bit 4:2:0 */
+    /* the Broadcasting macroblock layer is written for 8 bit */
     if (profile == AV_PROFILE_CAVS_BROADCASTING) {
         if (sample_precision != 1) {
             av_log(h->avctx, AV_LOG_ERROR,
                    "sample_precision %d is not 8 bit\n", sample_precision);
             return AVERROR_INVALIDDATA;
         }
-        if (chroma_format == 2) {
-            avpriv_request_sample(h->avctx, "4:2:2 chroma");
-            return AVERROR_PATCHWELCOME;
-        }
-        if (chroma_format != 1) {
-            av_log(h->avctx, AV_LOG_ERROR,
-                   "chroma_format %d is reserved\n", chroma_format);
-            return AVERROR_INVALIDDATA;
-        }
     }
+    /* legacy encoder clips (e.g. cavs.mpg) signal the reserved value 0
+     * while carrying 4:2:0 content; FFmpeg historically decoded those
+     * by ignoring the field.  In the AVS1-P16 spec 0 means 4:0:0
+     * (monochrome), which is not implemented - reject it for the
+     * Broadcasting profile rather than misdecoding it as 4:2:0. */
+    if (chroma_format == 3 ||
+        !chroma_format && profile == AV_PROFILE_CAVS_BROADCASTING) {
+        avpriv_report_missing_feature(h->avctx, "chroma_format %d",
+                                      chroma_format);
+        return AVERROR_PATCHWELCOME;
+    }
+    if (chroma_format != 2)
+        chroma_format = 1;
     aspect_ratio = get_bits(&h->gb, 4);
     frame_rate_code = get_bits(&h->gb, 4);
     if (frame_rate_code == 0 || frame_rate_code > 13) {
@@ -2141,6 +2238,13 @@ static int decode_seq_header(AVSContext *h)
         avpriv_report_missing_feature(h->avctx, "Macroblock grid changing");
         return AVERROR_PATCHWELCOME;
     }
+    /* the DPB references share the current chroma geometry; a mid-stream
+     * chroma_format change would let motion compensation read the old
+     * references with the new plane heights */
+    if (h->top_qp && chroma_format != h->chroma_format) {
+        avpriv_report_missing_feature(h->avctx, "chroma_format changing in CAVS");
+        return AVERROR_PATCHWELCOME;
+    }
 
     /* horizontal_size and vertical_size are only the displayed part */
     ret = ff_set_dimensions(h->avctx, mb_width * 16, mb_height * 16);
@@ -2158,6 +2262,7 @@ static int decode_seq_header(AVSContext *h)
     h->mb_width        = mb_width;
     h->mb_height       = mb_height;
     h->low_delay       = low_delay;
+    h->chroma_format   = chroma_format;
     h->avctx->profile  = profile;
     h->progressive_seq = progressive_seq;
     h->avctx->framerate = ff_mpeg12_frame_rate_tab[frame_rate_code];
@@ -2355,6 +2460,8 @@ static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
             ret = decode_seq_header(h);
             if (ret < 0)
                 return ret;
+            avctx->pix_fmt = h->chroma_format == 2 ? AV_PIX_FMT_YUV422P
+                                                   : AV_PIX_FMT_YUV420P;
             break;
         case PIC_I_START_CODE:
             if (!h->got_keyframe) {

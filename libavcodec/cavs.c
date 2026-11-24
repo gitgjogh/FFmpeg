@@ -121,17 +121,21 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
     uint8_t bs[8];
     int qp_avg, alpha, beta, tc;
     int i;
+    /* chroma macroblock height in samples: 8 for 4:2:0, 16 for 4:2:2 */
+    const int cm_h = h->chroma_format == 2 ? 16 : 8;
 
     /* save un-deblocked lines */
     h->topleft_border_y = h->top_border_y[h->mbx * 16 + 15];
     h->topleft_border_u = h->top_border_u[h->mbx * 10 + 8];
     h->topleft_border_v = h->top_border_v[h->mbx * 10 + 8];
     memcpy(&h->top_border_y[h->mbx * 16],     h->cy + 15 * h->l_stride, 16);
-    memcpy(&h->top_border_u[h->mbx * 10 + 1], h->cu +  7 * h->c_stride, 8);
-    memcpy(&h->top_border_v[h->mbx * 10 + 1], h->cv +  7 * h->c_stride, 8);
+    memcpy(&h->top_border_u[h->mbx * 10 + 1], h->cu + (cm_h - 1) * h->c_stride, 8);
+    memcpy(&h->top_border_v[h->mbx * 10 + 1], h->cv + (cm_h - 1) * h->c_stride, 8);
     for (i = 0; i < 8; i++) {
         h->left_border_y[i * 2 + 1] = *(h->cy + 15 + (i * 2 + 0) * h->l_stride);
         h->left_border_y[i * 2 + 2] = *(h->cy + 15 + (i * 2 + 1) * h->l_stride);
+    }
+    for (i = 0; i < cm_h; i++) {
         h->left_border_u[i + 1]     = *(h->cu + 7  +  i          * h->c_stride);
         h->left_border_v[i + 1]     = *(h->cv + 7  +  i          * h->c_stride);
     }
@@ -161,13 +165,39 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
                 h->cdsp.cavs_filter_lv(h->cy, h->l_stride, alpha, beta, tc, bs[0], bs[1]);
                 qp_avg = (ff_cavs_chroma_qp[h->qp] + ff_cavs_chroma_qp[h->left_qp] + 1) >> 1;
                 SET_PARAMS;
-                h->cdsp.cavs_filter_cv(h->cu, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
-                h->cdsp.cavs_filter_cv(h->cv, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
+                if (h->chroma_format == 2) {
+                    /* 4:2:2: the left chroma edge is 16 samples high, the
+                     * top half takes bs[0], the bottom half bs[1] (GDM
+                     * DeblockMb422) */
+                    h->cdsp.cavs_filter_cv(h->cu, h->c_stride, alpha, beta, tc, bs[0], bs[0]);
+                    h->cdsp.cavs_filter_cv(h->cu + 8 * h->c_stride, h->c_stride, alpha, beta, tc, bs[1], bs[1]);
+                } else {
+                    h->cdsp.cavs_filter_cv(h->cu, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
+                }
+                qp_avg = (ff_cavs_chroma_qp[h->qp] +
+                          ff_cavs_chroma_qp[h->left_qp] + 1) >> 1;
+                SET_PARAMS;
+                if (h->chroma_format == 2) {
+                    h->cdsp.cavs_filter_cv(h->cv, h->c_stride, alpha, beta, tc, bs[0], bs[0]);
+                    h->cdsp.cavs_filter_cv(h->cv + 8 * h->c_stride, h->c_stride, alpha, beta, tc, bs[1], bs[1]);
+                } else {
+                    h->cdsp.cavs_filter_cv(h->cv, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
+                }
             }
             qp_avg = h->qp;
             SET_PARAMS;
             h->cdsp.cavs_filter_lv(h->cy + 8,               h->l_stride, alpha, beta, tc, bs[2], bs[3]);
             h->cdsp.cavs_filter_lh(h->cy + 8 * h->l_stride, h->l_stride, alpha, beta, tc, bs[6], bs[7]);
+            if (h->chroma_format == 2) {
+                /* 4:2:2: the internal horizontal luma edge coincides with
+                 * the edge between the two chroma 8x8 blocks */
+                qp_avg = ff_cavs_chroma_qp[h->qp];
+                SET_PARAMS;
+                h->cdsp.cavs_filter_ch(h->cu + 8 * h->c_stride, h->c_stride, alpha, beta, tc, bs[6], bs[7]);
+                qp_avg = ff_cavs_chroma_qp[h->qp];
+                SET_PARAMS;
+                h->cdsp.cavs_filter_ch(h->cv + 8 * h->c_stride, h->c_stride, alpha, beta, tc, bs[6], bs[7]);
+            }
 
             if (h->flags & B_AVAIL) {
                 qp_avg = (h->qp + h->top_qp[h->mbx] + 1) >> 1;
@@ -246,8 +276,15 @@ void ff_cavs_load_intra_pred_luma(AVSContext *h, uint8_t *top,
 void ff_cavs_load_intra_pred_chroma(AVSContext *h)
 {
     /* extend borders by one pixel */
-    h->left_border_u[9]              = h->left_border_u[8];
-    h->left_border_v[9]              = h->left_border_v[8];
+    if (h->chroma_format == 2) {
+        /* 4:2:2: left_border_u/v[1..16] hold the full 16-sample column
+         * of the left MB; the lowpass of the first 8x8 block reads the
+         * real sample below it (index 9), the second 8x8 block extends
+         * its own local copy in ff_cavs_intra_pred_chroma_422() */
+    } else {
+        h->left_border_u[9]              = h->left_border_u[8];
+        h->left_border_v[9]              = h->left_border_v[8];
+    }
     if(h->flags & C_AVAIL) {
         h->top_border_u[h->mbx*10 + 9] = h->top_border_u[h->mbx*10 + 11];
         h->top_border_v[h->mbx*10 + 9] = h->top_border_v[h->mbx*10 + 11];
@@ -391,6 +428,39 @@ void ff_cavs_modify_mb_i(AVSContext *h, int *pred_mode_uv)
     }
 }
 
+/**
+ * intra prediction of the second chroma 8x8 block of a 4:2:2 macroblock
+ * (GDM "block 6&7 intra decoding"): its top neighbour is the just decoded
+ * bottom line of the first chroma block of the same macroblock (always
+ * available), its left neighbours are the bottom half of the left
+ * macroblock's chroma column
+ * @param dc        destination (top-left sample of the second block)
+ * @param left_border  left border column of the whole 8x16 chroma area
+ * @param pred_mode raw intra_chroma_pred_mode_422 from the bitstream
+ */
+void ff_cavs_intra_pred_chroma_422(AVSContext *h, uint8_t *dc,
+                                   uint8_t *left_border, int pred_mode)
+{
+    uint8_t top[18];
+    uint8_t left[10];
+
+    memcpy(&top[1], dc - h->c_stride, 8);
+    /* the top-right samples belong to the not yet coded right MB */
+    memset(&top[9], top[8], 9);
+    if (h->flags & A_AVAIL) {
+        /* the corner sample is the left column sample of the line above */
+        top[0] = left_border[8];
+    } else {
+        top[0] = top[1];
+        modify_pred(left_modifier_c, &pred_mode);
+    }
+    left[0] = top[0];
+    memcpy(&left[1], &left_border[9], 8);
+    left[9] = left[8];
+
+    h->intra_pred_c[pred_mode](dc, top, left, h->c_stride);
+}
+
 /*****************************************************************************
  *
  * motion compensation
@@ -410,13 +480,17 @@ static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int parity,
 
     const int mx         = mv->x + src_x_offset * 8;
     const int my         = mv->y + src_y_offset * 8;
+    /* chroma displacement in 1/8 chroma pel units; for 4:2:2 the chroma
+     * vertical resolution is the full luma resolution, so the vertical
+     * displacement doubles (GDM: j1 = pix_c_y * 8 + 2 * mvy) */
+    const int my_c       = h->chroma_format == 2 ? 2 * my : my;
     const int luma_xy    = (mx & 3) + ((my & 3) << 2);
     uint8_t *src_y       = pic->data[0] + parity * pic->linesize[0] +
                            (mx >> 2) + (my >> 2) * h->l_stride;
     uint8_t *src_cb      = pic->data[1] + parity * pic->linesize[1] +
-                           (mx >> 3) + (my >> 3) * h->c_stride;
+                           (mx >> 3) + (my_c >> 3) * h->c_stride;
     uint8_t *src_cr      = pic->data[2] + parity * pic->linesize[2] +
-                           (mx >> 3) + (my >> 3) * h->c_stride;
+                           (mx >> 3) + (my_c >> 3) * h->c_stride;
     int extra_width      = 0;
     int extra_height     = extra_width;
     const int full_mx    = mx >> 2;
@@ -425,7 +499,11 @@ static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int parity,
     /* motion vectors address a field in quarter field lines (9.9.2.1) */
     const int pic_height = h->pic_structure ? 16 * h->mb_height
                                             :  8 * h->mb_height;
+    /* chroma vertical resolution: half of luma for 4:2:0, full for 4:2:2 */
+    const int pic_height_c = h->chroma_format == 2 ? pic_height
+                                                   : pic_height >> 1;
     int emu = 0;
+
 
     if (mx & 7)
         extra_width  -= 3;
@@ -452,22 +530,22 @@ static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int parity,
     if (emu) {
         h->vdsp.emulated_edge_mc(h->edge_emu_buffer, src_cb,
                                  h->c_stride, h->c_stride,
-                                 9, 9 /* FIXME */,
-                                 mx >> 3, my >> 3,
-                                 pic_width >> 1, pic_height >> 1);
+                                 9, chroma_height + 1,
+                                 mx >> 3, my_c >> 3,
+                                 pic_width >> 1, pic_height_c);
         src_cb = h->edge_emu_buffer;
     }
-    chroma_op(dest_cb, src_cb, h->c_stride, chroma_height, mx & 7, my & 7);
+    chroma_op(dest_cb, src_cb, h->c_stride, chroma_height, mx & 7, my_c & 7);
 
     if (emu) {
         h->vdsp.emulated_edge_mc(h->edge_emu_buffer, src_cr,
                                  h->c_stride, h->c_stride,
-                                 9, 9 /* FIXME */,
-                                 mx >> 3, my >> 3,
-                                 pic_width >> 1, pic_height >> 1);
+                                 9, chroma_height + 1,
+                                 mx >> 3, my_c >> 3,
+                                 pic_width >> 1, pic_height_c);
         src_cr = h->edge_emu_buffer;
     }
-    chroma_op(dest_cr, src_cr, h->c_stride, chroma_height, mx & 7, my & 7);
+    chroma_op(dest_cr, src_cr, h->c_stride, chroma_height, mx & 7, my_c & 7);
 }
 
 static inline void mc_part_std(AVSContext *h, int chroma_height,
@@ -483,10 +561,12 @@ static inline void mc_part_std(AVSContext *h, int chroma_height,
 {
     qpel_mc_func *qpix_op =  qpix_put;
     h264_chroma_mc_func chroma_op = chroma_put;
+    /* for 4:2:2 the chroma block keeps the luma block's height */
+    chroma_height <<= (h->chroma_format == 2);
 
     dest_y   += x_offset * 2 + y_offset * h->l_stride * 2;
-    dest_cb  += x_offset     + y_offset * h->c_stride;
-    dest_cr  += x_offset     + y_offset * h->c_stride;
+    dest_cb  += x_offset     + (y_offset << (h->chroma_format == 2)) * h->c_stride;
+    dest_cr  += x_offset     + (y_offset << (h->chroma_format == 2)) * h->c_stride;
     x_offset += 8 * h->mbx;
     /* the row is counted inside the current field (clause 3.24) */
     y_offset += 8 * h->field_mby;
@@ -676,6 +756,8 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
 void ff_cavs_set_mb_row(AVSContext *h)
 {
     int parity = 0;
+    /* chroma macroblock height: 8 samples for 4:2:0, 16 for 4:2:2 */
+    const int cm_h = h->chroma_format == 2 ? 16 : 8;
 
     h->field     = !h->pic_structure && h->mby >= h->mb_height / 2;
     h->field_mby = h->mby - h->field * (h->mb_height / 2);
@@ -688,9 +770,9 @@ void ff_cavs_set_mb_row(AVSContext *h)
     h->cy = h->cur.f->data[0] + parity * h->cur.f->linesize[0] +
             h->field_mby * 16 * h->l_stride;
     h->cu = h->cur.f->data[1] + parity * h->cur.f->linesize[1] +
-            h->field_mby *  8 * h->c_stride;
+            h->field_mby * cm_h * h->c_stride;
     h->cv = h->cur.f->data[2] + parity * h->cur.f->linesize[2] +
-            h->field_mby *  8 * h->c_stride;
+            h->field_mby * cm_h * h->c_stride;
 }
 
 /**

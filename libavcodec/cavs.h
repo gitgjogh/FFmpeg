@@ -197,6 +197,7 @@ typedef struct AVSContext {
     int progressive_seq;
     int profile, level;
     int aspect_ratio;
+    int chroma_format; ///< 1: 4:2:0, 2: 4:2:2 (level 4.2/6.2 streams)
     int mb_width, mb_height;
     int width, height;
     int stream_revision; ///<0 for samples from 2006, 1 for rm52j encoder
@@ -259,6 +260,8 @@ typedef struct AVSContext {
     int qp_fixed;
     int pic_qp_fixed;
     int cbp;
+    int cbp422;        ///< coded block pattern of the second chroma 8x8
+                       ///< blocks (4:2:2): bit0 = U, bit1 = V
     DECLARE_ALIGNED(32, int16_t, block)[64];
     uint8_t permutated_scantable[64];
     /** inverse block scan method 2 of clause 9.5.3 c), for field pictures */
@@ -269,7 +272,7 @@ typedef struct AVSContext {
     /** intra prediction is done with un-deblocked samples
      they are saved here before deblocking the MB  */
     uint8_t *top_border_y, *top_border_u, *top_border_v;
-    uint8_t left_border_y[26], left_border_u[10], left_border_v[10];
+    uint8_t left_border_y[26], left_border_u[17], left_border_v[17];
     uint8_t intern_border_y[26];
     uint8_t topleft_border_y, topleft_border_u, topleft_border_v;
 
@@ -350,6 +353,8 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_load_intra_pred_luma(AVSContext *h, uint8_t *top, uint8_t **left,
                                   int block);
 void ff_cavs_load_intra_pred_chroma(AVSContext *h);
+void ff_cavs_intra_pred_chroma_422(AVSContext *h, uint8_t *dc,
+                                   uint8_t *left_border, int pred_mode);
 void ff_cavs_modify_mb_i(AVSContext *h, int *pred_mode_uv);
 void ff_cavs_inter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
